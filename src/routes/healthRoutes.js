@@ -3,10 +3,8 @@ const prisma = require('../lib/prisma');
 
 const router = express.Router();
 
-// Liveness — process is up.
 router.get('/', (req, res) => res.json({ status: 'ok' }));
 
-// Readiness — Postgres is reachable.
 router.get('/ready', async (req, res) => {
     try {
         await prisma.$queryRaw`SELECT 1`;

@@ -1,8 +1,6 @@
 const AppError = require('../utils/appError');
 
-// Usage: router.post('/', validate({ body: schema, query: schema, params: schema }), handler)
-// Parsed (coerced/defaulted) values replace the originals; query goes to req.validatedQuery
-// because req.query is a read-only getter in Express 5.
+
 const validate = (schemas) => (req, res, next) => {
     for (const key of ['params', 'query', 'body']) {
         if (!schemas[key]) continue;

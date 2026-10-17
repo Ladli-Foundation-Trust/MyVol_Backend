@@ -1,7 +1,6 @@
 const AppError = require('../utils/appError');
 const { isProd } = require('../config/env');
 
-// Body shape: { status, message, details? } — the app's client.js reads `message`.
 
 const fromPrisma = (err) => {
     switch (err.code) {

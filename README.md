@@ -48,7 +48,37 @@ src/generated/prisma    generated client (git-ignored)
 
 Errors are `{ status, message, details? }`. The app's `src/api/client.js` reads `message`.
 
+## Auth
+
+Base: `/api/v1/auth`. Access token = 15-minute JWT, sent as `Authorization: Bearer <token>`.
+Refresh token = opaque 30-day token, returned in the body **and** as an HTTP-only cookie
+(scoped to `/api/v1/auth`). Only SHA-256 hashes of refresh tokens are stored.
+
+| Method | Path | Auth | Body |
+|---|---|---|---|
+| POST | `/signup` | – | `name, email, username, password` |
+| POST | `/login` | – | `email, password` |
+| POST | `/refresh` | – | `refreshToken` (optional if the cookie is sent) |
+| POST | `/logout` | – | `refreshToken` (optional if the cookie is sent) |
+| POST | `/forgot-password` | – | `email` |
+| POST | `/reset-password` | – | `email, otp, newPassword` |
+| GET | `/me` | Bearer | – |
+| POST | `/logout-all` | Bearer | – |
+| PATCH | `/change-password` | Bearer | `currentPassword, newPassword` |
+
+- Passwords: argon2id; 8–128 chars with at least one letter and one number.
+- Refresh tokens rotate on every use. Replaying a used one revokes that whole login (reuse detection).
+- `users.token_version` is embedded in access tokens; password change/reset and logout-all bump it,
+  which kills every outstanding access token immediately.
+- Reset codes are 6 digits, valid 10 minutes, max 5 wrong tries. **No email provider yet:
+  outside production the code is printed to the server console.**
+- Rate limits (per IP, in memory): login 10 / 15 min, signup 10 / hour, forgot + reset 5 / 15 min.
+  Restarting the server resets them. Use a Redis store before running more than one instance.
+
 ## Prisma 7 notes
+
+- `prisma migrate dev` does **not** regenerate the client. Run `npm run db:generate` after every
+  migration, or the server fails on startup with "Unknown field".
 
 - The connection URL lives in `prisma.config.js`, not `schema.prisma`.
 - Prisma 7 does not load `.env` by itself; `dotenv/config` does it.
