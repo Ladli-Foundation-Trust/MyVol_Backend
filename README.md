@@ -31,6 +31,14 @@ Phone: `npm run adb:reverse` from the app folder so `localhost:3000` reaches thi
 | `npm run db:reset` | Drop, re-migrate, re-seed (destroys local data) |
 | `npm run db:studio` | Prisma Studio GUI on http://localhost:5555 |
 | `npm run db:seed` | Run `prisma/seed.js` |
+| `npm test` | Migrate the test DB, then run the integration tests (`test/`) |
+| `npm run auth:cleanup` | Purge expired tokens/codes and accounts past their deletion date |
+
+### Tests
+
+One-time setup: `CREATE DATABASE myvolapp_test OWNER myvolapp;` then `cp .env.test.example .env.test`
+and fill in the password. Tests truncate tables and refuse to run unless the DB name ends in `_test`.
+Sent mail goes to an in-memory outbox (`src/lib/mailer.js`) where tests read the codes.
 
 ## Layout
 
@@ -50,31 +58,63 @@ Errors are `{ status, message, details? }`. The app's `src/api/client.js` reads 
 
 ## Auth
 
-Base: `/api/v1/auth`. Access token = 15-minute JWT, sent as `Authorization: Bearer <token>`.
-Refresh token = opaque 30-day token, returned in the body **and** as an HTTP-only cookie
-(scoped to `/api/v1/auth`). Only SHA-256 hashes of refresh tokens are stored.
+Base `/api/v1/auth`. How it works: [flow.md](flow.md). Why it works that way: [decision.md](decision.md).
 
-| Method | Path | Auth | Body |
+- **Access token**: 15-minute JWT (`sub`, `sid` = session id, `role`), sent as `Authorization: Bearer`.
+- **Refresh token**: opaque, 30 days sliding, single use (rotates on every refresh). Returned in the
+  body (mobile → SecureStore) and as an httpOnly cookie scoped to `/api/v1/auth` (web).
+- Every session (= device) is a row in `sessions`; revoking it kills its tokens at once.
+
+| Method | Path | Auth | Body / query |
 |---|---|---|---|
-| POST | `/signup` | – | `name, email, username, password` |
-| POST | `/login` | – | `email, password` |
-| POST | `/refresh` | – | `refreshToken` (optional if the cookie is sent) |
-| POST | `/logout` | – | `refreshToken` (optional if the cookie is sent) |
+| POST | `/signup` | – | `name, email, username, password, dateOfBirth (YYYY-MM-DD), acceptTerms: true, deviceName?` |
+| POST | `/login` | – | `identifier` (email or username), `password, deviceName?` |
+| POST | `/google` | – | `idToken, deviceName?` + for new users `dateOfBirth, acceptTerms, username?` |
+| POST | `/refresh` | – | `refreshToken` (or the cookie) |
+| POST | `/logout` | – | `refreshToken` (or the cookie) |
+| GET | `/username-available` | – | `?username=` |
 | POST | `/forgot-password` | – | `email` |
 | POST | `/reset-password` | – | `email, otp, newPassword` |
 | GET | `/me` | Bearer | – |
+| POST | `/email/verify` | Bearer | `otp` |
+| POST | `/email/verify/resend` | Bearer | – |
+| POST | `/email/change` | Bearer | `newEmail, password` |
+| POST | `/email/change/confirm` | Bearer | `otp` (sent to the new address) |
+| PATCH | `/change-password` | Bearer | `currentPassword, newPassword` (Google-only users: just `newPassword`) |
+| GET | `/sessions` | Bearer | – |
+| DELETE | `/sessions/:sessionId` | Bearer | – |
 | POST | `/logout-all` | Bearer | – |
-| PATCH | `/change-password` | Bearer | `currentPassword, newPassword` |
+| POST | `/account/deactivate` | Bearer | `password` |
+| POST | `/account/delete` | Bearer | `password` |
 
-- Passwords: argon2id; 8–128 chars with at least one letter and one number.
-- Refresh tokens rotate on every use. Replaying a used one revokes that whole login (reuse detection).
-- `users.token_version` is embedded in access tokens; password change/reset and logout-all bump it,
-  which kills every outstanding access token immediately.
-- Reset codes are 6 digits, valid 10 minutes, max 5 wrong tries. **No email provider yet:
-  outside production the code is printed to the server console.**
-- Rate limits (per IP, in memory): login 10 / 15 min, signup 10 / hour, forgot + reset 5 / 15 min.
-  Restarting the server resets them. Use a Redis store before running more than one instance.
+Session responses: `{ user, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, reactivated?, isNewUser? }`.
 
+### Error codes the app should handle
+
+Errors are `{ status, message, code?, details? }`. Branch on `code`, show `message`.
+
+| HTTP | `code` | App should |
+|---|---|---|
+| 401 | `TOKEN_EXPIRED` | call `/refresh` **once** (single-flight across all pending requests) and retry |
+| 401 | `SESSION_INVALID`, `ACCOUNT_INACTIVE`, `TOKEN_INVALID`, `NOT_AUTHENTICATED` | clear tokens, go to login |
+| 400 | `PROFILE_REQUIRED` | (Google) ask for `details[].field`, call `/google` again with the same idToken |
+| 403 | `INVALID_PASSWORD` / `REAUTH_REQUIRED` | show error / ask the user to sign in again. **Not** a logout |
+| 403 | `EMAIL_NOT_VERIFIED` | open the verify-email screen |
+| 403 | `ACCOUNT_SUSPENDED` | show a suspension notice |
+| 429 | `ACCOUNT_LOCKED`, `CODE_COOLDOWN`, `CODE_LIMIT`, `RATE_LIMITED` | show `message` |
+
+### Policies
+
+- Passwords: argon2id; 8–128 chars, a letter and a number, not a common password, not containing the username/email.
+- Age gate: `MIN_SIGNUP_AGE` (13). Terms acceptance is timestamped.
+- Lockout: every 5th consecutive failed login locks the account (15 min, doubling, max 24 h).
+- 6-digit codes: HMAC-hashed, 5 tries each, 60 s resend cooldown, max 5 per hour.
+  **Without `SMTP_URL`, mail (and codes) are printed to the server console outside production.**
+- Max 10 live sessions per user; the least recently used one is logged out.
+- Deactivate = hidden until next login. Delete = 30-day grace, then purged by the cleanup job.
+- Use `requireVerifiedEmail` (after `protect`) on routes that create content or message people.
+- Rate limits are in memory (reset on restart). Use a Redis store before running more than one instance.
+- Cleanup runs every 6 h in-process (advisory-locked, so safe with several instances) and via `npm run auth:cleanup`.
 ## Prisma 7 notes
 
 - `prisma migrate dev` does **not** regenerate the client. Run `npm run db:generate` after every

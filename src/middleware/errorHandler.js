@@ -23,8 +23,13 @@ module.exports = (err, req, res, next) => {
 
     if (err.name === 'PrismaClientKnownRequestError') error = fromPrisma(err) || err;
     if (err.type === 'entity.parse.failed') error = new AppError('Malformed JSON body', 400);
-    if (err.name === 'JsonWebTokenError') error = new AppError('Invalid token. Please log in again', 401);
-    if (err.name === 'TokenExpiredError') error = new AppError('Your token has expired. Please log in again', 401);
+    if (err.name === 'JsonWebTokenError' || err.name === 'NotBeforeError') {
+        error = new AppError('Invalid token. Please log in again', 401, undefined, 'TOKEN_INVALID');
+    }
+    // Clients refresh on TOKEN_EXPIRED and only log the user out on other 401 codes.
+    if (err.name === 'TokenExpiredError') {
+        error = new AppError('Your token has expired', 401, undefined, 'TOKEN_EXPIRED');
+    }
 
     const statusCode = error.statusCode || 500;
     const operational = error.isOperational === true;
@@ -35,6 +40,7 @@ module.exports = (err, req, res, next) => {
         status: error.status || 'error',
         message: operational || !isProd ? error.message : 'Something went wrong',
     };
+    if (operational && error.code) body.code = error.code;
     if (error.details) body.details = error.details;
     if (!isProd) body.stack = err.stack;
 

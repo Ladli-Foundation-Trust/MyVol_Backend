@@ -1,6 +1,14 @@
 const env = require('./src/config/env');
 const app = require('./src/app');
 const prisma = require('./src/lib/prisma');
+const { runAuthCleanup } = require('./src/jobs/authCleanup');
+
+const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+const cleanup = () =>
+    runAuthCleanup()
+        .then((result) => result && console.log('[auth-cleanup]', result))
+        .catch((err) => console.error('[auth-cleanup] failed:', err.message));
 
 const start = async () => {
     try {
@@ -15,8 +23,13 @@ const start = async () => {
         console.log(`MyVolApp API on http://localhost:${env.PORT}/api/v1 (${env.NODE_ENV})`);
     });
 
+    cleanup();
+    // unref: the timer alone must not keep the process alive during shutdown.
+    const cleanupTimer = setInterval(cleanup, CLEANUP_INTERVAL_MS).unref();
+
     const shutdown = (signal) => {
         console.log(`${signal} received, shutting down`);
+        clearInterval(cleanupTimer);
         server.close(async () => {
             await prisma.$disconnect();
             process.exit(0);

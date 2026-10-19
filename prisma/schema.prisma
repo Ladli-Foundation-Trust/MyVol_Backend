@@ -14,55 +14,141 @@ enum Role {
   ADMIN
 }
 
+// ACTIVE is the only status that can use the API. DEACTIVATED and PENDING_DELETION
+// flip back to ACTIVE on the next successful login; SUSPENDED is set by moderators.
+enum AccountStatus {
+  ACTIVE
+  DEACTIVATED
+  PENDING_DELETION
+  SUSPENDED
+}
+
+enum CodePurpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  EMAIL_CHANGE
+}
+
+enum AuthProvider {
+  GOOGLE
+}
+
 model User {
-  id                String    @id @default(uuid()) @db.Uuid
-  email             String    @unique
-  username          String    @unique
-  name              String
-  role              Role      @default(USER)
-  passwordHash      String?   @map("password_hash")
-  passwordChangedAt DateTime? @map("password_changed_at")
-  tokenVersion      Int       @default(0) @map("token_version")
-  lastLoginAt       DateTime? @map("last_login_at")
-  createdAt         DateTime  @default(now()) @map("created_at")
-  updatedAt         DateTime  @updatedAt @map("updated_at")
+  id                  String        @id @default(uuid()) @db.Uuid
+  email               String        @unique
+  username            String        @unique
+  name                String
+  role                Role          @default(USER)
+  status              AccountStatus @default(ACTIVE)
+  dateOfBirth         DateTime?     @map("date_of_birth") @db.Date
+  emailVerifiedAt     DateTime?     @map("email_verified_at")
+  // Null for accounts created through Google until the user sets a password.
+  passwordHash        String?       @map("password_hash")
+  passwordChangedAt   DateTime?     @map("password_changed_at")
+  failedLoginCount    Int           @default(0) @map("failed_login_count")
+  lockedUntil         DateTime?     @map("locked_until")
+  lastLoginAt         DateTime?     @map("last_login_at")
+  termsAcceptedAt     DateTime?     @map("terms_accepted_at")
+  deactivatedAt       DateTime?     @map("deactivated_at")
+  deletionScheduledAt DateTime?     @map("deletion_scheduled_at")
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
 
-  refreshTokens       RefreshToken[]
-  passwordResetTokens PasswordResetToken[]
+  sessions          Session[]
+  verificationCodes VerificationCode[]
+  oauthAccounts     OAuthAccount[]
+  authEvents        AuthEvent[]
 
+  @@index([status, deletionScheduledAt])
   @@map("users")
+}
+
+// One row per logged-in device. Refresh tokens rotate inside a session; revoking
+// the session kills its refresh token and, through `protect`, its access tokens.
+model Session {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  deviceName    String?   @map("device_name")
+  userAgent     String?   @map("user_agent")
+  ip            String?
+  expiresAt     DateTime  @map("expires_at")
+  lastUsedAt    DateTime  @default(now()) @map("last_used_at")
+  revokedAt     DateTime? @map("revoked_at")
+  revokedReason String?   @map("revoked_reason")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("sessions")
 }
 
 model RefreshToken {
   id        String    @id @default(uuid()) @db.Uuid
-  userId    String    @map("user_id") @db.Uuid
+  sessionId String    @map("session_id") @db.Uuid
   tokenHash String    @unique @map("token_hash")
-  familyId  String    @map("family_id") @db.Uuid
   expiresAt DateTime  @map("expires_at")
-  revokedAt DateTime? @map("revoked_at")
-  userAgent String?   @map("user_agent")
-  ip        String?
+  // Set when the token is exchanged. Presenting a used token again = theft.
+  usedAt    DateTime? @map("used_at")
   createdAt DateTime  @default(now()) @map("created_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
-  @@index([familyId])
+  @@index([sessionId])
   @@index([expiresAt])
   @@map("refresh_tokens")
 }
 
-model PasswordResetToken {
-  id        String    @id @default(uuid()) @db.Uuid
-  userId    String    @map("user_id") @db.Uuid
-  codeHash  String    @map("code_hash")
-  attempts  Int       @default(0)
-  expiresAt DateTime  @map("expires_at")
-  usedAt    DateTime? @map("used_at")
-  createdAt DateTime  @default(now()) @map("created_at")
+// Short-lived 6-digit codes. Only an HMAC of the code is stored.
+model VerificationCode {
+  id        String      @id @default(uuid()) @db.Uuid
+  userId    String      @map("user_id") @db.Uuid
+  purpose   CodePurpose
+  codeHash  String      @map("code_hash")
+  // The new address for EMAIL_CHANGE; null otherwise.
+  target    String?
+  attempts  Int         @default(0)
+  expiresAt DateTime    @map("expires_at")
+  usedAt    DateTime?   @map("used_at")
+  createdAt DateTime    @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@index([userId, purpose])
+  @@index([expiresAt])
+  @@map("verification_codes")
+}
+
+model OAuthAccount {
+  id             String       @id @default(uuid()) @db.Uuid
+  userId         String       @map("user_id") @db.Uuid
+  provider       AuthProvider
+  providerUserId String       @map("provider_user_id")
+  email          String?
+  createdAt      DateTime     @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerUserId])
   @@index([userId])
-  @@map("password_reset_tokens")
+  @@map("oauth_accounts")
+}
+
+// Append-only security log (logins, failures, password changes, token reuse...).
+model AuthEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @map("user_id") @db.Uuid
+  type      String
+  ip        String?
+  userAgent String?  @map("user_agent")
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
+  @@map("auth_events")
 }

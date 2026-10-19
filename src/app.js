@@ -7,6 +7,7 @@ const cookieParser = require('cookie-parser');
 const env = require('./config/env');
 const AppError = require('./utils/appError');
 const errorHandler = require('./middleware/errorHandler');
+const { apiLimiter } = require('./middleware/rateLimit');
 const healthRoutes = require('./routes/healthRoutes');
 const apiRoutes = require('./routes');
 
@@ -26,7 +27,8 @@ app.use(
         credentials: true,
     }),
 );
-app.use(morgan(env.isProd ? 'combined' : 'dev'));
+if (!env.isTest) app.use(morgan(env.isProd ? 'combined' : 'dev'));
+app.use('/api', apiLimiter);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());

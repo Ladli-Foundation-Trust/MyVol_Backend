@@ -11,6 +11,7 @@ async function main() {
             username: 'admin',
             name: 'Admin',
             role: 'ADMIN',
+            emailVerifiedAt: new Date(),
         },
     });
     console.log('Seed complete');
