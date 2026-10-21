@@ -1,6 +1,7 @@
 const { z } = require('zod');
 const env = require('../config/env');
 const { isReserved } = require('../utils/username');
+const { toE164 } = require('../utils/phone');
 const COMMON_PASSWORDS = require('./commonPasswords');
 
 const email = z
@@ -57,17 +58,31 @@ const otp = z.string().trim().regex(/^\d{6}$/, 'must be a 6-digit code');
 
 const loginPassword = z.string().min(1, 'is required').max(128);
 
+// Accepts "98765 43210", "+91 98765-43210" etc.; always comes out as E.164.
+const phone = z
+    .string()
+    .trim()
+    .max(20)
+    .refine((v) => toE164(v) !== null, 'must be a valid mobile number')
+    .transform(toE164);
+
+const phoneToken = z.string().min(1, 'is required').max(1024);
+
+const userId = z.uuid('is not a valid account id');
+
+const noPersonalInfoInPassword = (d, ctx) => {
+    const pw = d.password.toLowerCase();
+    const personal = [d.username, d.email?.split('@')[0]].filter((s) => s && s.length >= 4);
+    if (personal.some((s) => pw.includes(s))) {
+        ctx.addIssue({ code: 'custom', path: ['password'], message: 'must not contain your username or email' });
+    }
+};
+
 const signup = z
     .strictObject({ name, email, username, password, dateOfBirth, acceptTerms, deviceName })
-    .superRefine((d, ctx) => {
-        const pw = d.password.toLowerCase();
-        const personal = [d.username, d.email.split('@')[0]].filter((s) => s.length >= 4);
-        if (personal.some((s) => pw.includes(s))) {
-            ctx.addIssue({ code: 'custom', path: ['password'], message: 'must not contain your username or email' });
-        }
-    });
+    .superRefine(noPersonalInfoInPassword);
 
-// `identifier` is an email or a username.
+// `identifier` is an email, a username or a phone number.
 const login = z.strictObject({
     identifier: z.string().trim().toLowerCase().min(1, 'is required').max(254),
     password: loginPassword,
@@ -107,7 +122,26 @@ const confirmPassword = z.strictObject({ password: loginPassword.optional() }).d
 
 const sessionParams = z.strictObject({ sessionId: z.uuid('is not a valid session id') });
 
+// ---------- phone ----------
+
+const sendPhoneCode = z.strictObject({ phone, purpose: z.enum(['signup', 'login', 'change']) });
+
+const verifyPhoneCode = z.strictObject({ phone, otp });
+
+const phoneSignup = z
+    .strictObject({ phoneToken, name, username, password, dateOfBirth, acceptTerms, deviceName })
+    .superRefine(noPersonalInfoInPassword);
+
+const phoneLogin = z.strictObject({ phoneToken, userId, deviceName });
+
+const phoneResetPassword = z.strictObject({ phoneToken, userId, newPassword: password });
+
+const phoneChange = z.strictObject({ phoneToken, password: loginPassword.optional() });
+
 module.exports = {
+    // field rules reused by userValidators
+    fields: { name, username, dateOfBirth },
+
     signup,
     login,
     google,
@@ -120,4 +154,10 @@ module.exports = {
     emailChange,
     confirmPassword,
     sessionParams,
+    sendPhoneCode,
+    verifyPhoneCode,
+    phoneSignup,
+    phoneLogin,
+    phoneResetPassword,
+    phoneChange,
 };

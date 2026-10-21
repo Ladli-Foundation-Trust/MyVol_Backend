@@ -3,6 +3,7 @@ const request = require('supertest');
 const app = require('../src/app');
 const prisma = require('../src/lib/prisma');
 const { outbox } = require('../src/lib/mailer');
+const { outbox: smsOutbox } = require('../src/lib/sms');
 
 const api = () => request(app);
 const AUTH = '/api/v1/auth';
@@ -12,8 +13,9 @@ const resetDb = async () => {
     if (!/\/\w+_test\?/.test(process.env.DATABASE_URL)) {
         throw new Error('Tests must run against a *_test database (see .env.test.example)');
     }
-    await prisma.$executeRawUnsafe('TRUNCATE users, auth_events CASCADE');
+    await prisma.$executeRawUnsafe('TRUNCATE users, auth_events, phone_codes CASCADE');
     outbox.length = 0;
+    smsOutbox.length = 0;
 };
 
 let counter = 0;
@@ -51,6 +53,26 @@ const lastCodeFor = (email) => {
     return mail.subject.slice(0, 6);
 };
 
+// SMS codes go to the sms outbox; the code is the first 6 characters of the text.
+const lastSmsCodeFor = (phone) => {
+    const sms = [...smsOutbox].reverse().find((m) => m.to === phone && /^\d{6} /.test(m.text));
+    assert.ok(sms, `no code texted to ${phone}`);
+    return sms.text.slice(0, 6);
+};
+
 const bearer = (token) => ({ Authorization: `Bearer ${token}` });
 
-module.exports = { api, AUTH, prisma, outbox, resetDb, newUserBody, signup, login, lastCodeFor, bearer };
+module.exports = {
+    api,
+    AUTH,
+    prisma,
+    outbox,
+    smsOutbox,
+    resetDb,
+    newUserBody,
+    signup,
+    login,
+    lastCodeFor,
+    lastSmsCodeFor,
+    bearer,
+};

@@ -6,6 +6,7 @@ const cookieParser = require('cookie-parser');
 
 const env = require('./config/env');
 const AppError = require('./utils/appError');
+const storage = require('./lib/storage');
 const errorHandler = require('./middleware/errorHandler');
 const { apiLimiter } = require('./middleware/rateLimit');
 const healthRoutes = require('./routes/healthRoutes');
@@ -32,6 +33,15 @@ app.use('/api', apiLimiter);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
+
+// Uploaded files (avatars). Names are random and never reused, so they can be cached
+// for a year. Cross-origin so a web client on another domain can show them.
+// In production these move to S3/a CDN (see src/lib/storage.js).
+app.use(
+    '/uploads',
+    helmet.crossOriginResourcePolicy({ policy: 'cross-origin' }),
+    express.static(storage.ROOT, { immutable: true, maxAge: '365d', index: false, dotfiles: 'deny' }),
+);
 
 app.use('/health', healthRoutes);
 app.use('/api/v1', apiRoutes);

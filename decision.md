@@ -46,7 +46,8 @@ Used tokens are kept 7 days (cleanup job) so late replays are still caught.
 
 ### D5. Email verification by 6-digit code, required only for publishing
 **Decision.** Signup sends a code. Users can log in and browse unverified. Routes that create content
-or contact people must add the `requireVerifiedEmail` middleware (403 `EMAIL_NOT_VERIFIED`).
+or contact people must add the `requireVerified` middleware (403 `EMAIL_NOT_VERIFIED`). Renamed from
+`requireVerifiedEmail` in D30: a phone number counts as verified too.
 **Why.** Blocking login until verification loses many sign-ups (mail delays, typos). Gating only
 *publishing* still stops throwaway/bot accounts from spamming, which is the real risk on a social app.
 Codes instead of links: the app has no deep-link email handling yet, and codes work on any device.
@@ -226,12 +227,165 @@ The test helper refuses to run unless the DB name ends in `_test`. Rate limiters
 `npm audit --omit=dev` reports 0 vulnerabilities. The remaining advisories are in dev-only tools
 (nodemon's `chokidar`/`braces`).
 
+### D29. Dev-only OTP echo for Postman testing (2026-10-19)
+**Decision.** `EXPOSE_OTP_IN_RESPONSE=true` adds `devOtp` to signup, resend-verification, forgot-password
+and email-change responses. The default is off, the server exits at startup if it is on in production, and
+`.env.test` pins it off so the tests check the real response shape. A Postman collection in `postman/`
+drives every flow end to end.
+**Why.** There's no email provider yet (D21). Reading codes from the server console works but interrupts
+running the whole flow in Postman. The flag sits in one helper (`devOtp` in `authService`), so the
+production code path does not change.
+**Trade-off.** With the flag on, forgot-password reveals which emails exist. This is acceptable only for local use.
+
+### D30. Phone sign-up and login, up to 4 accounts per number (2026-10-21)
+**Decision.** Instagram-style: `phone/send-code` → `phone/verify-code` returns a `phoneToken` plus the
+accounts already on the number → one of `phone/signup`, `phone/login` (SMS code, no password),
+`phone/reset-password`, `phone/change`. `POST /login` also accepts a phone as `identifier`.
+- The number is verified **before** the account exists, so `users.phone` is only ever a verified number
+  (no `phone_verified_at` column needed). Codes live in `phone_codes`, keyed by number, not user.
+- `users.phone` is not unique; `MAX_ACCOUNTS_PER_PHONE=4` is enforced inside the transaction behind a
+  per-number advisory lock, so concurrent sign-ups can't create a 5th. `users.email` became nullable,
+  with a CHECK that email or phone is set.
+- `phoneToken` is a 15-minute JWT with its own audience (can't be used as an access token) whose `jti` is
+  the code row. Using it sets `consumed_at` inside the action's transaction: single use, but a failed
+  signup (e.g. username taken) rolls back and the user can retry without a new SMS.
+- `send-code` with `purpose: login` answers the same whether or not the number has accounts, and only
+  texts numbers that do. `signup`/`change` check the 4-account limit before any SMS is paid for.
+- Phone + password with several accounts: the password picks the account (oldest first if two share one).
+  To reach a specific account, log in by username or use the SMS code and pick it.
+- An extra per-IP `smsLimiter` (20 per 15 min) on top of the per-number caps, against SMS-pumping fraud.
+**Why 4 and why not unique.** People run a personal and a volunteer/organisation account from one phone;
+Instagram allows several per number. A small cap stops one SIM farming hundreds of accounts.
+**Trade-off.** Phone-only users get no security emails (they have no email); a phone change texts the
+old number. Real SMS delivery is still to do (`src/lib/sms.js` is the only place to change).
+
+### D31. Profiles: core fields on `users`, extended volunteer fields in `profiles` (2026-10-21)
+**Decision.** `bio`, `avatar_key`, `is_private` and the follow counters live on `users`, because every list
+row and profile header needs them. The Profile Details screen's extended fields (location, gender,
+education, skills, preferred areas, availability, volunteering types, `show_personal_details`) live in an
+optional 1:1 `profiles` row, created on first edit. Option lists are validated in zod, not as DB enums, so
+the app can add an option without a migration. Arrays are Postgres `text[]`.
+**Why.** Keeps the auth table lean and avoids a join for the common case (cards), while `GET /:user` gets
+everything with one include. One `PATCH /users/me` serves the whole edit screen.
+
+### D32. Follow graph with denormalised counters
+**Decision.** `follows(follower_id, following_id)` with a composite PK and `follow_requests` for private
+accounts. `followers_count`/`following_count` on users change only inside the transaction that writes the
+follow row (`followService.addFollow/removeFollow`), driven by the rows actually changed
+(`createMany skipDuplicates` / `deleteMany`), so double taps and races can't skew them. CHECK constraints
+stop negative counts and self-follows. The cleanup job subtracts a purged user's follows before the
+cascade deletes them.
+**Why.** Counting on every profile view doesn't scale; counters that drift are a classic social-app bug.
+**Known gap.** Deactivated users still count in other people's totals (they're hidden from the lists).
+Instagram behaves similarly; revisit if users notice.
+
+### D33. Privacy rule in one place; Instagram-like private accounts
+**Decision.** `socialGraph.canView(viewer, user, followStatus)` = own, public, or approved follower. A
+private profile still shows name, username, avatar, bio and counts (so people know who they're
+requesting), but `details` is null and lists are 403 `PRIVATE_ACCOUNT`. Going public auto-approves pending
+requests. Gender, DOB and education need `showPersonalDetails` even for followers. Inactive users are 404
+everywhere. Posts, stories and comments must reuse `canView`.
+
+### D34. Avatar upload: server-side processing, storage behind an interface
+**Decision.** `PUT /users/me/avatar` (multipart). sharp checks the real format (JPEG/PNG/WebP/HEIC; SVG
+refused), caps input at 40 MP, auto-rotates, crops to 512×512 WebP and strips metadata (phone photos carry
+GPS). Files are stored under random keys via `lib/storage.js` (local disk, served at `/uploads`); the DB
+stores the key and URLs are built at read time from `PUBLIC_BASE_URL`. `sharp` is ^0.35.5 because older
+versions carry high-severity libvips advisories.
+**Why not signed direct-to-S3 uploads (as the plan suggests).** There's no bucket yet, and avatars are small
+and need processing anyway. Post photos/videos (Phase 5) are where direct signed uploads pay off; only
+`storage.js` has to change, and existing keys keep working.
+
+### D35. Usernames: changeable every 14 days; `:user` accepts id or username
+**Decision.** `PATCH /users/me/username` with `USERNAME_CHANGE_COOLDOWN_DAYS` (14) and an audit event. Routes
+take `:user` as a UUID or a username (usernames can't contain "-", so they never look like a UUID). The
+app should store ids and use usernames for deep links like `myvolapp://u/priya`.
+**Not done.** Old usernames are released immediately (Instagram holds them ~14 days).
+
+### D36. Posts: one multipart request, images only for now (2026-10-22)
+**Decision.** `POST /posts` takes the form fields and up to 6 photos in one multipart request (JSON works
+for text-only posts). Each photo is checked and re-encoded by sharp (longest side 1440 px, WebP, upright,
+metadata stripped) and stored via `lib/storage.js`; `post_media` keeps the key, size and order. Width and
+height are returned so the app can size the feed before images load. Field rules mirror the app's
+ActivityForm (title ≤ 60, description ≤ 500 and required without photos, 9 categories, hours ≤ 24).
+**Why not upload-then-attach.** It needs orphan cleanup for uploads never attached, and photos are small
+enough for one request. Videos (Reels phase) should switch to direct signed uploads to S3.
+**Not done.** Videos; changing a post's photos after creation (PATCH edits text fields only).
+
+### D37. Post status with POST_AUTO_APPROVE until moderation exists
+**Decision.** Posts have `status` UNDER_REVIEW / APPROVED / REJECTED (+ `rejection_reason`), matching
+the app. Only APPROVED posts reach other people; the author always sees their own. Because reviewers
+can't approve anything until the moderation phase, `POST_AUTO_APPROVE=true` (default) approves on
+creation, which is what the app's mock already does. When moderation ships, set it to false: new posts
+start UNDER_REVIEW and an edit sends a post back to review.
+
+### D38. One visibility rule for posts, built on canView
+**Decision.** `findVisiblePost` (single post) and `visibleTo` (Prisma where for lists) encode: author →
+always; anyone else → APPROVED, author ACTIVE, and `socialGraph.canView` (public or approved follower).
+Every read and every reaction (like, save, share, comment, comment like) goes through it, so a private
+account's posts can't be liked or commented on by outsiders through a guessed id. Hidden posts are 404,
+private ones 403 `PRIVATE_ACCOUNT`.
+
+### D39. Feeds: chronological with keyset pagination
+**Decision.** Home = your posts + approved posts of people you follow; Explore = approved posts from public
+accounts, filterable by categories and city (case-insensitive match on `location`). Both are newest first,
+paginated with the same opaque (created_at, id) cursor as follow lists.
+**Why.** Correct and cheap at this size (indexes on author/status/category + created_at). Ranking
+("popular", "near me"), fan-out tables and caching wait until usage shows they're needed.
+
+### D40. Engagement counters: same pattern as follows; recount on bulk deletes
+**Decision.** likes/saves/comments counters change in the transaction that writes the row, driven by
+`createMany skipDuplicates` / `deleteMany` counts (double taps and concurrent requests are tested).
+Deleting a comment recounts the post's comments (covers its cascaded replies). Purging a user recounts
+every post and comment they touched. `@updatedAt` isn't used on posts because counter updates would
+look like edits; `edited_at` is set only by PATCH. Shares count taps on the share button (not
+de-duplicated, like Instagram).
+**Comments.** One reply level, oldest first; the comment's author and the post's author may delete.
+Creating posts/comments needs a verified email or phone (`requireVerified`); likes/saves don't.
+
+### D41. Videos processed locally with bundled ffmpeg, behind one module (2026-10-22)
+**Decision.** Video uploads go through `lib/videos.js`: ffprobe validates (real video stream, length ≤
+`MAX_VIDEO_SECONDS`), then ffmpeg either re-packages (H.264/yuv420p/AAC, unrotated, ≤ 1080p: seconds) or
+transcodes to 720p H.264 (`veryfast`, CRF 23), always dropping metadata (phones embed GPS) and adding
+`+faststart` so playback starts before the download finishes. A WebP cover is cut at ~1 s. Binaries come
+from npm (`ffmpeg-static` 6.1, `@ffprobe-installer/ffprobe` 2023 build; the older `ffprobe-static` 4.0 was
+rejected because it parses untrusted files). Transcodes are serialised, uploads stream to temp files, not
+memory. Files are served by express.static, which supports range requests.
+**Why.** Works on any dev machine with `npm install`; the API and DB shape (`url`, `thumbnailUrl`,
+`durationMs`) won't change when processing moves to the cloud.
+**Trade-off / later.** Processing happens inside the upload request, so long videos make a slow request,
+and one server can only transcode so much. For production: direct signed uploads to S3 + a video service
+(Mux, Cloudinary, MediaConvert) with HLS, notifying the API when ready. Only `videos.js`, `storage.js` and
+the create flow change.
+
+### D42. Reels are single-video posts; views per unique viewer
+**Decision.** No separate reels table: `posts.is_reel` = exactly one media item and it is a video (set on
+create, indexed). `GET /posts/reels` uses the normal visibility rule. `post_views` has one row per
+(viewer, post): the first play counts a view (`views_count`), later plays add `plays` and `watch_ms`; the
+author's plays aren't counted.
+**Why.** Matches Instagram (a single-video post is a reel and also shows in the feed) and keeps one code
+path for likes, comments and visibility. Watch time is stored now so ranking (watch-through rate,
+trending) can be added later without a migration. The feed is chronological until then.
+
+### D43. Demo seed for local testing
+**Decision.** `npm run db:seed:demo` creates the app's demo volunteers (`@demo.myvolapp.local`) with avatars,
+follows, 5 reels (ffmpeg test patterns, or your own clips with `--videos`), photo posts, a carousel, likes,
+comments and views, all through the real services. `--reset` removes them via the normal purge.
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|
 | Two-factor auth (TOTP + backup codes) | No UI in the app yet. Recommended before public launch, at least for staff/moderator roles. |
 | Sign in with Apple | Required by App Store rules if Google sign-in ships on iOS. Android-first for now. |
-| Phone number / SMS OTP login | The signup form collects a mobile number, but SMS costs money and needs a DLT-registered sender in India. |
+| Real SMS delivery | Phone auth is built (D30) but codes go to the console. Needs a provider (MSG91 etc.) and a DLT-registered sender in India. |
+| Block / mute, suggested volunteers | Phase 8. Plug block checks into `socialGraph` (findActiveUser/canView). |
+| Cloud video (HLS, background processing) | Local ffmpeg for now (D41). |
+| Reels ranking | Chronological; watch time is already recorded (D42). |
+| Feed ranking / "Near me" / trending | Chronological is enough for now (D39). |
+| Reporting posts/comments, approve/reject | Moderation phase. Set `POST_AUTO_APPROVE=false` then (D37). |
+| Follow notifications | Phase 10 (notifications). The follow/accept code paths are the hook points. |
+| S3/CDN storage | Swap `src/lib/storage.js` when a bucket exists (D34). |
+| Removing a phone / freeing a slot | Not needed yet. Deleting the account frees the slot after the grace period. |
 | "New login from X" emails | Needs device fingerprinting to avoid spam. The audit log already has the data. |
 | Admin suspend/unsuspend endpoints | Belongs to the moderation phase. The `SUSPENDED` status is already enforced everywhere. |
 | Breached-password check (HIBP) | See D24. |

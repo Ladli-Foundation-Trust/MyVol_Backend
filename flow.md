@@ -51,7 +51,7 @@ and rejected promises to `src/middleware/errorHandler.js`, which also maps JWT e
 | | `accountActionLimiter` | per-user limit, placed **after** `protect` so `req.user` exists |
 | `middleware/validate.js` | `validate({ body, query, params })` | runs the zod schema from `validators/authValidators.js`; replaces `req.body` with the cleaned data (`req.validatedQuery` for query) or throws 400 with `details` |
 | `middleware/auth.js` | `protect` | see §3 |
-| | `requireVerifiedEmail` | 403 `EMAIL_NOT_VERIFIED` unless `req.user.emailVerified` (for future posting/messaging routes) |
+| | `requireVerified` | 403 `EMAIL_NOT_VERIFIED` unless `req.user.verified` (verified email or a phone; for future posting/messaging routes) |
 | | `restrictTo(...roles)` | 403 unless `req.user.role` matches |
 
 ## 3. `protect`: how a signed-in request is checked
@@ -205,9 +205,81 @@ Next login → completeLogin sets ACTIVE again (cancels both).
 After the date → jobs/authCleanup purges the user (cascade).
 ```
 
+### Phone (Instagram-style): `/auth/phone/*`
+
+```
+send-code {phone, purpose}     phoneAuthService.sendCode
+  signup|change: assertPhoneHasRoom (409 PHONE_LIMIT_REACHED at 4 accounts) → issue → SMS
+  login:         no accounts on the number → 200 and no SMS (same answer either way)
+verify-code {phone, otp}       phoneCodeService.verify → { phoneToken (JWT, aud myvolapp-phone,
+                               15 min, jti = phone_codes row), accounts: [{id, username, name}] }
+then exactly one of (each consumes the phoneToken; consumed_at makes it single use):
+  phone/signup          tx: lockPhone (advisory lock) → assertPhoneHasRoom → consume → create user → session
+  phone/login           account must have that phone → consume → completeLogin('phone_code')
+  phone/reset-password  account must have that phone → tx: consume, new hash, clear lockout, revoke all sessions
+  phone/change (Bearer) re-auth → tx: lock → room → consume → set phone, revoke other sessions → tell old number/email
+```
+`POST /login` with a phone as `identifier` checks the password against each account on that number
+(at most 4) and signs in to the one it matches.
+
 ### Username check: `GET /auth/username-available?username=`
 ```
 usernameCheckLimiter → validate({ query }) (format + reserved → 400) → authService.checkUsername → { available }
+```
+
+## 4b. Profiles & follow (`/api/v1/users`, all behind `protect`)
+
+```
+userRoutes → userController → profileService / followService → socialGraph
+                                                     │
+  findActiveUser(:user)   id or username, status ACTIVE only (else 404 USER_NOT_FOUND)
+  relationsFor(viewer, ids)  3 queries → followStatus (following|requested|none) + followsYou
+  canView(viewer, user)   own || public || following      ← reuse for posts later
+```
+- **Follow**: tx { already following? → 'following' | private → follow_requests row → 'requested'
+  | addFollow }. `addFollow`/`removeFollow` are the only writers of `follows`; they use
+  createMany(skipDuplicates)/deleteMany and touch the counters only when a row really changed.
+- **Accept request**: tx { delete request (404 if none) → addFollow }. **Go public**: tx { update
+  user → acceptAllRequests }.
+- **Lists**: keyset pagination on (created_at desc, other user id desc); cursor = base64url
+  "iso|id" (`utils/cursor.js`), so pages don't shift when people follow meanwhile.
+- **Avatar**: multer (memory, 5 MB, field `avatar`) → sharp (format whitelist, rotate, 512² WebP,
+  metadata stripped) → storage.save(`avatars/<uuid>.webp`) → users.avatar_key → delete old file.
+  Files are served by express.static at `/uploads` (cross-origin, cached 1 year).
+- **Username change**: cooldown on `username_changed_at`; P2002 → 409 USERNAME_TAKEN.
+
+## 4c. Posts (`/api/v1/posts`, `/api/v1/comments`, all behind `protect`)
+
+```
+postRoutes/commentRoutes → postController → postService / commentService → socialGraph
+  findVisiblePost(viewer, id)  author → always; else APPROVED + author ACTIVE + canView(author)
+                               (404 POST_NOT_FOUND / 403 PRIVATE_ACCOUNT)
+  visibleTo(viewer)            the same rule as a Prisma where (saved list)
+  toPosts(viewer, posts)       + likedByMe, savedByMe, author followStatus: 3 queries per page
+```
+- **Create**: requireVerified → postLimiter → multer (≤ 6 × 10 MB, field `media`) → zod (coerces
+  multipart strings) → sharp each photo (1440 px WebP) → storage.save → `post.create` with media rows;
+  if the insert fails the files are deleted. Status = APPROVED if POST_AUTO_APPROVE else UNDER_REVIEW.
+- **Feeds** (keyset on created_at desc, id desc): home = own OR (APPROVED AND author followed by me);
+  explore = APPROVED AND author public; both skip inactive authors.
+- **Like/save**: tx { createMany skipDuplicates / deleteMany → counter ±1 only if a row changed }.
+- **Comments**: tx { create (parent = top-level comment) → post.comments_count +1 → parent.replies_count +1 }.
+  Delete: tx { delete (replies cascade) → recount post.comments_count → parent.replies_count −1 }.
+
+## 4d. Videos & reels
+
+```
+POST /posts (multer → OS temp files, deleted when the response closes)
+  per file: video/* → videos.processVideo(path)       (queued: one ffmpeg at a time)
+                        ffprobe → duration ≤ MAX_VIDEO_SECONDS, has a video stream
+                        h264 + yuv420p + aac + no rotation + ≤1080p → ffmpeg -c copy
+                        else → libx264 veryfast crf 23, 720p short side, aac
+                        always: -map_metadata -1 (no GPS), +faststart; cover frame → WebP
+            image/*  → images.toPostImage
+  storage.save(posts/<uuid>.mp4 + .webp) → post.create(isReel = 1 item && VIDEO)
+GET /posts/reels   pageOfPosts({ isReel, ...visibleTo(viewer) })
+POST /:id/view     visible + has a video; author → no-op; tx { createMany post_views
+                   skipDuplicates → views_count+1 | else plays+1, watch_ms+= }
 ```
 
 ## 5. Background job
@@ -224,6 +296,9 @@ jobs/authCleanup.runAuthCleanup
     delete refresh tokens expired, or used > 7 d ago
     delete codes          created > 1 d ago
     delete auth_events    older than 180 d
+    (before purging users: subtract their follows from other users' counters, note which
+     posts/comments they liked, saved or commented on; after the delete, recount those
+     counters; after commit: delete their avatar and post photo files)
 ```
 
 ## 6. Data model (prisma/schema.prisma)
@@ -233,7 +308,19 @@ users ─┬─< sessions ─< refresh_tokens        a session = one device; tok
        ├─< verification_codes                purpose: EMAIL_VERIFICATION | PASSWORD_RESET | EMAIL_CHANGE
        ├─< oauth_accounts                    (provider, provider_user_id) unique
        └─< auth_events                       append-only audit log
+users ─┬─o profiles                          1:1, created on first profile edit
+       ├─< follows (follower_id, following_id)      PK pair; CHECK not self
+       └─< follow_requests (requester_id, target_id) pending follows of private accounts
+users ─┬─< posts ─┬─< post_media (position)       photos; key = storage key
+       │          ├─< post_likes (user_id, post_id)
+       │          ├─< post_saves (user_id, post_id)
+       │          ├─< post_views (user_id, post_id)  plays, watch_ms; first play = a view
+       │          └─< comments ─< comment_likes     comments.parent_id → top-level comment
+users.followers_count / following_count, posts.likes/comments/saves/shares_count and
+comments.likes/replies_count are denormalised (CHECK >= 0).
 All child FKs: ON DELETE CASCADE → purging a user removes everything above.
+users.email is nullable, users.phone (E.164, indexed, NOT unique); CHECK email OR phone is set.
+phone_codes (no FK: keyed by number, the account may not exist yet), purged after 1 day.
 ```
 
 ## 7. What the app has to do
@@ -250,4 +337,7 @@ All child FKs: ON DELETE CASCADE → purging a user removes everything above.
 ## 8. Tests
 
 `test/helpers.js` (supertest app, `resetDb` guard for `*_test` databases, `lastCodeFor` reads codes from
-`mailer.outbox`) and `test/auth.test.js` (30 tests, one `describe` per flow above). Run `npm test`.
+`mailer.outbox`, `lastSmsCodeFor` reads `sms.outbox`), `test/auth.test.js` (30 tests, one `describe`
+per flow above), `test/phone.test.js` (16 phone tests) , `test/users.test.js` (17 profile/follow
+tests) , `test/posts.test.js` (17 post/feed/comment tests) and `test/videos.test.js` (7 video/reel tests,
+clips generated with ffmpeg). Run `npm test`.

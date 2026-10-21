@@ -27,7 +27,9 @@ const sendMail = async ({ to, subject, text }) => {
 // Fire-and-forget: a slow or failing mail server must not fail the request, and
 // the response time must not reveal whether an email was actually sent.
 // Move this onto a job queue (BullMQ etc.) once there is more than one instance.
+// Phone-only accounts have no email, so `to` may be null: there is nobody to tell.
 const queueMail = (message) => {
+    if (!message.to) return;
     sendMail(message).catch((err) => console.error(`[mail] "${message.subject}" failed:`, err.message));
 };
 

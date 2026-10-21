@@ -1,8 +1,44 @@
+# Dependencies
 node_modules/
+
+# Env files: none are committed, not even the *.example templates (team decision).
+# Share .env.example privately with new developers.
 .env
 .env.*
-!.env.example
-!.env.test.example
+*.pem
+*.key
+
+# Generated Prisma client (rebuilt by `npm install` / `prisma generate`)
 src/generated/
+
+# Postman: collections, environments and run reports stay local (they can hold tokens)
+postman/
+*.postman_collection.json
+*.postman_environment.json
+*.postman_globals.json
+postman-cli-reports/
+newman/
+
+# Logs
 *.log
+logs/
+npm-debug.log*
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Uploads and temp files
+uploads/
+tmp/
+*.tmp
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
 .DS_Store
+Thumbs.db
+desktop.ini

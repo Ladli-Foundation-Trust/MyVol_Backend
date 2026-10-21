@@ -24,6 +24,11 @@ module.exports = {
         text: `The email on your ${APP_NAME} account was changed to ${newEmail}. This address will no longer receive account emails.${footer}`,
     }),
 
+    phoneChanged: () => ({
+        subject: `Your ${APP_NAME} phone number was changed`,
+        text: `The phone number on your ${APP_NAME} account was changed and your other devices were signed out.${footer}`,
+    }),
+
     googleLinked: () => ({
         subject: `Google sign-in was connected to your ${APP_NAME} account`,
         text: `You can now sign in to ${APP_NAME} with Google.${footer}`,

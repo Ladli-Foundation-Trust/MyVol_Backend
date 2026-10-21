@@ -23,6 +23,14 @@ module.exports = (err, req, res, next) => {
 
     if (err.name === 'PrismaClientKnownRequestError') error = fromPrisma(err) || err;
     if (err.type === 'entity.parse.failed') error = new AppError('Malformed JSON body', 400);
+    if (err.name === 'MulterError') {
+        error =
+            err.code === 'LIMIT_FILE_SIZE'
+                ? new AppError('That file is too large', 413, undefined, 'FILE_TOO_LARGE')
+                : ['LIMIT_FILE_COUNT', 'LIMIT_UNEXPECTED_FILE'].includes(err.code)
+                  ? new AppError('Too many files, or a file in the wrong field (use "media", at most 6)', 400, undefined, 'INVALID_UPLOAD')
+                  : new AppError(`Upload rejected: ${err.message}`, 400, undefined, 'INVALID_UPLOAD');
+    }
     if (err.name === 'JsonWebTokenError' || err.name === 'NotBeforeError') {
         error = new AppError('Invalid token. Please log in again', 401, undefined, 'TOKEN_INVALID');
     }

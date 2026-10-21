@@ -23,7 +23,7 @@ const protect = async (req, res, next) => {
             userId: true,
             revokedAt: true,
             createdAt: true,
-            user: { select: { id: true, role: true, status: true, emailVerifiedAt: true } },
+            user: { select: { id: true, role: true, status: true, emailVerifiedAt: true, phone: true } },
         },
     });
     if (!session || session.revokedAt || session.userId !== payload.sub) {
@@ -36,7 +36,8 @@ const protect = async (req, res, next) => {
     req.user = {
         id: session.user.id,
         role: session.user.role, // from the DB, not the token, so demotions apply at once
-        emailVerified: Boolean(session.user.emailVerifiedAt),
+        // A verified email or any phone (phones are only saved after an SMS code).
+        verified: Boolean(session.user.emailVerifiedAt || session.user.phone),
         sessionId: payload.sid,
         sessionCreatedAt: session.createdAt,
     };
@@ -44,9 +45,10 @@ const protect = async (req, res, next) => {
 };
 
 // For routes that publish content or contact other people (posting, commenting,
-// messaging). Keeps throwaway/bot sign-ups from spamming before proving an inbox.
-const requireVerifiedEmail = (req, res, next) => {
-    if (!req.user?.emailVerified) {
+// messaging). Keeps throwaway/bot sign-ups from spamming before proving an inbox
+// or a phone number.
+const requireVerified = (req, res, next) => {
+    if (!req.user?.verified) {
         return next(new AppError('Please verify your email to do this', 403, undefined, 'EMAIL_NOT_VERIFIED'));
     }
     next();
@@ -61,4 +63,4 @@ const restrictTo =
         next();
     };
 
-module.exports = { protect, requireVerifiedEmail, restrictTo };
+module.exports = { protect, requireVerified, restrictTo };

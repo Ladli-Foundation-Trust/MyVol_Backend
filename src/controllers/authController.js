@@ -34,7 +34,11 @@ const clearRefreshCookie = (res) => res.clearCookie(REFRESH_COOKIE, cookieOption
 
 const sendUser = (res, user) => res.json({ status: 'success', data: { user } });
 
-const sendMessage = (res, message, data) => res.json({ status: 'success', message, ...(data && { data }) });
+const sendMessage = (res, message, data) =>
+    res.json({ status: 'success', message, ...(data && Object.keys(data).length > 0 && { data }) });
+
+// Shared with phoneAuthController.
+Object.assign(exports, { requestContext, sendSession, sendUser, sendMessage, clearRefreshCookie });
 
 // ---------- public ----------
 
@@ -71,8 +75,8 @@ exports.usernameAvailable = async (req, res) => {
 };
 
 exports.forgotPassword = async (req, res) => {
-    await authService.requestPasswordReset(req.body, requestContext(req));
-    sendMessage(res, 'If an account exists for this email, a reset code has been sent');
+    const dev = await authService.requestPasswordReset(req.body, requestContext(req));
+    sendMessage(res, 'If an account exists for this email, a reset code has been sent', dev);
 };
 
 exports.resetPassword = async (req, res) => {
@@ -92,8 +96,8 @@ exports.verifyEmail = async (req, res) => {
 };
 
 exports.resendEmailVerification = async (req, res) => {
-    await authService.resendEmailVerification(req.user.id);
-    sendMessage(res, 'A new verification code has been sent');
+    const dev = await authService.resendEmailVerification(req.user.id);
+    sendMessage(res, 'A new verification code has been sent', dev);
 };
 
 exports.changePassword = async (req, res) => {
@@ -101,8 +105,8 @@ exports.changePassword = async (req, res) => {
 };
 
 exports.requestEmailChange = async (req, res) => {
-    await authService.requestEmailChange(req.user, req.body, requestContext(req));
-    sendMessage(res, 'We sent a code to your new email. Enter it to confirm the change');
+    const dev = await authService.requestEmailChange(req.user, req.body, requestContext(req));
+    sendMessage(res, 'We sent a code to your new email. Enter it to confirm the change', dev);
 };
 
 exports.confirmEmailChange = async (req, res) => {

@@ -19,6 +19,24 @@ const signAccessToken = (user, sessionId) => {
 const verifyAccessToken = (token) =>
     jwt.verify(token, env.JWT_ACCESS_SECRET, { ...JWT_OPTIONS, algorithms: ['HS256'] });
 
+// Proof that the holder just entered the SMS code for `phone`. A separate audience
+// means it can never be accepted as an access token (and vice versa). `jti` is the
+// phone_codes row, which is marked consumed when the token is used.
+const PHONE_TOKEN_OPTIONS = { algorithm: 'HS256', issuer: 'myvolapp-api', audience: 'myvolapp-phone' };
+
+const signPhoneToken = (phone, codeId, ttlMinutes) => {
+    const phoneToken = jwt.sign({}, env.JWT_ACCESS_SECRET, {
+        ...PHONE_TOKEN_OPTIONS,
+        subject: phone,
+        jwtid: codeId,
+        expiresIn: `${ttlMinutes}m`,
+    });
+    return { phoneToken, phoneTokenExpiresAt: new Date(jwt.decode(phoneToken).exp * 1000) };
+};
+
+const verifyPhoneToken = (token) =>
+    jwt.verify(token, env.JWT_ACCESS_SECRET, { ...PHONE_TOKEN_OPTIONS, algorithms: ['HS256'] });
+
 const generateRefreshToken = () => crypto.randomBytes(48).toString('base64url');
 
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
@@ -39,6 +57,8 @@ const safeEqual = (a, b) => {
 module.exports = {
     signAccessToken,
     verifyAccessToken,
+    signPhoneToken,
+    verifyPhoneToken,
     generateRefreshToken,
     sha256,
     generateOtp,

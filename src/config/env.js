@@ -27,12 +27,34 @@ const schema = z.object({
     ACCOUNT_DELETION_GRACE_DAYS: z.coerce.number().int().positive().default(30),
     REAUTH_WINDOW_MINUTES: z.coerce.number().int().positive().default(10),
 
+    // Phone sign-up/login. Codes are printed to the console until an SMS provider is wired in.
+    PHONE_CODE_TTL_MINUTES: z.coerce.number().int().positive().default(10),
+    MAX_ACCOUNTS_PER_PHONE: z.coerce.number().int().positive().default(4),
+
+    // Profiles. Uploads are stored on local disk under UPLOAD_DIR and served at
+    // PUBLIC_BASE_URL/uploads (set it to the LAN IP, e.g. http://192.168.1.5:3000, for a phone).
+    PUBLIC_BASE_URL: z.url().optional(),
+    UPLOAD_DIR: z.string().default('uploads'),
+    MAX_AVATAR_MB: z.coerce.number().positive().max(20).default(5),
+    USERNAME_CHANGE_COOLDOWN_DAYS: z.coerce.number().int().min(0).default(14),
+
+    // Posts. Until reviewers can approve posts (moderation phase), new posts are
+    // approved on creation; set false once that ships so they start UNDER_REVIEW.
+    POST_AUTO_APPROVE: z.stringbool().default(true),
+    MAX_POST_IMAGE_MB: z.coerce.number().positive().max(30).default(10),
+    // Videos are processed on this server for now (lib/videos.js), so keep them short.
+    MAX_POST_VIDEO_MB: z.coerce.number().positive().max(1024).default(100),
+    MAX_VIDEO_SECONDS: z.coerce.number().int().positive().max(900).default(180),
+
     // Google sign-in: every OAuth client ID whose ID tokens we accept (Android, iOS, web).
     GOOGLE_CLIENT_IDS: z.string().default(''),
 
     // Email. Without SMTP_URL, mail is printed to the console outside production.
     SMTP_URL: z.url().optional(),
     MAIL_FROM: z.string().default('MyVolApp <no-reply@myvolapp.local>'),
+
+    // Local testing only (Postman): echo 6-digit codes back as `devOtp` in API responses.
+    EXPOSE_OTP_IN_RESPONSE: z.stringbool().default(false),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -45,6 +67,12 @@ if (!parsed.success) {
 
 const env = parsed.data;
 
+// Codes in responses would let anyone verify any email or reset any password.
+if (env.NODE_ENV === 'production' && env.EXPOSE_OTP_IN_RESPONSE) {
+    console.error('EXPOSE_OTP_IN_RESPONSE must not be enabled in production.');
+    process.exit(1);
+}
+
 if (env.NODE_ENV === 'production' && !env.SMTP_URL) {
     console.warn('[env] SMTP_URL is not set: verification and reset codes cannot be delivered.');
 }
@@ -55,4 +83,5 @@ module.exports = {
     isTest: env.NODE_ENV === 'test',
     corsOrigins: list(env.CORS_ORIGINS),
     googleClientIds: list(env.GOOGLE_CLIENT_IDS),
+    publicBaseUrl: (env.PUBLIC_BASE_URL ?? `http://localhost:${env.PORT}`).replace(/\/+$/, ''),
 };

@@ -9,6 +9,7 @@ const codes = require('./verificationCodeService');
 const { queueMail } = require('../lib/mailer');
 const { assertReauthenticated } = require('./reauthService');
 const { usernameCandidates, isReserved } = require('../utils/username');
+const { toE164, isPhoneLike } = require('../utils/phone');
 const { WITH_PASSWORD, toPublicUser } = require('../utils/publicUser');
 const { hashPassword, verifyPassword, verifyDummy } = require('../utils/password');
 
@@ -21,7 +22,7 @@ const LOCK_EVERY = 5;
 const LOCK_BASE_MINUTES = 15;
 const LOCK_MAX_MINUTES = 24 * 60;
 
-const INVALID_CREDENTIALS = 'Incorrect email/username or password';
+const INVALID_CREDENTIALS = 'Incorrect username, email, phone number or password';
 
 // ---------- helpers ----------
 
@@ -43,9 +44,14 @@ const pickUsername = async (emailLocalPart) => {
     throw new AppError('Could not generate a username. Please choose one', 409, undefined, 'USERNAME_TAKEN');
 };
 
+// Local testing only (see EXPOSE_OTP_IN_RESPONSE): lets Postman read the code from the
+// response instead of the console. Spread into results; empty when the flag is off.
+const devOtp = (otp) => (env.EXPOSE_OTP_IN_RESPONSE ? { devOtp: otp } : {});
+
 const sendVerificationCode = async (user) => {
     const otp = await codes.issue(user.id, 'EMAIL_VERIFICATION', { ttlMinutes: env.EMAIL_CODE_TTL_MINUTES });
     queueMail({ to: user.email, ...emails.verifyEmail(otp, env.EMAIL_CODE_TTL_MINUTES) });
+    return devOtp(otp);
 };
 
 const recordFailedLogin = async (userId, ctx) => {
@@ -112,17 +118,32 @@ const signup = async ({ name, email, username, password, dateOfBirth }, ctx) => 
     });
 
     audit.record(EVENTS.SIGNUP, { userId: user.id, ctx, metadata: { method: 'password' } });
-    await sendVerificationCode(user);
+    const dev = await sendVerificationCode(user);
 
-    return { user: toPublicUser(user), ...tokens };
+    return { user: toPublicUser(user), ...tokens, ...dev };
 };
 
-const login = async ({ identifier, password }, ctx) => {
-    const where = identifier.includes('@') ? { email: identifier } : { username: identifier };
-    const user = await prisma.user.findUnique({ where, ...WITH_PASSWORD });
+const isLocked = (user) => user.lockedUntil && user.lockedUntil > new Date();
 
-    if (user?.lockedUntil && user.lockedUntil > new Date()) {
-        const minutes = Math.ceil((user.lockedUntil.getTime() - Date.now()) / MINUTE_MS);
+// An email or username matches at most one account; a phone number can match up to
+// MAX_ACCOUNTS_PER_PHONE.
+const findLoginCandidates = (identifier) => {
+    const phone = isPhoneLike(identifier) && toE164(identifier);
+    if (phone) return prisma.user.findMany({ where: { phone }, orderBy: { createdAt: 'asc' }, ...WITH_PASSWORD });
+    const where = identifier.includes('@') ? { email: identifier } : { username: identifier };
+    return prisma.user.findMany({ where, ...WITH_PASSWORD });
+};
+
+// For a phone with several accounts, the password picks the account (like Instagram).
+// If two of them share a password the oldest wins; the user can log in with the
+// username, or with an SMS code and the account picker, to reach the other.
+const login = async ({ identifier, password }, ctx) => {
+    const users = await findLoginCandidates(identifier);
+    const unlocked = users.filter((u) => !isLocked(u));
+
+    if (users.length > 0 && unlocked.length === 0) {
+        const until = Math.min(...users.map((u) => u.lockedUntil.getTime()));
+        const minutes = Math.ceil((until - Date.now()) / MINUTE_MS);
         throw new AppError(
             `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? '' : 's'} or reset your password`,
             429,
@@ -131,16 +152,19 @@ const login = async ({ identifier, password }, ctx) => {
         );
     }
 
-    // Unknown users still pay for an argon2 verify, so response time doesn't reveal
-    // which emails/usernames exist.
-    const ok = user?.passwordHash ? await verifyPassword(user.passwordHash, password) : await verifyDummy(password);
-    if (!ok) {
-        if (user) await recordFailedLogin(user.id, ctx);
-        else audit.record(EVENTS.LOGIN_FAILED, { ctx, metadata: { reason: 'unknown_user' } });
-        throw new AppError(INVALID_CREDENTIALS, 401, undefined, 'INVALID_CREDENTIALS');
+    for (const user of unlocked) {
+        if (user.passwordHash && (await verifyPassword(user.passwordHash, password))) {
+            return completeLogin(user, ctx, 'password');
+        }
     }
 
-    return completeLogin(user, ctx, 'password');
+    // Unknown users still pay for an argon2 verify, so response time doesn't reveal
+    // which emails/usernames/phones exist.
+    if (!unlocked.some((u) => u.passwordHash)) await verifyDummy(password);
+
+    if (users.length === 0) audit.record(EVENTS.LOGIN_FAILED, { ctx, metadata: { reason: 'unknown_user' } });
+    for (const user of unlocked) await recordFailedLogin(user.id, ctx);
+    throw new AppError(INVALID_CREDENTIALS, 401, undefined, 'INVALID_CREDENTIALS');
 };
 
 const loginWithGoogle = async ({ idToken, username, dateOfBirth, acceptTerms }, ctx) => {
@@ -260,10 +284,13 @@ const verifyEmail = async (userId, { otp }, ctx) => {
 
 const resendEmailVerification = async (userId) => {
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, emailVerifiedAt: true } });
+    if (!user.email) {
+        throw new AppError('Add an email to your account first', 400, undefined, 'NO_EMAIL');
+    }
     if (user.emailVerifiedAt) {
         throw new AppError('Your email is already verified', 400, undefined, 'EMAIL_ALREADY_VERIFIED');
     }
-    await sendVerificationCode(user);
+    return sendVerificationCode(user);
 };
 
 // ---------- passwords ----------
@@ -283,6 +310,7 @@ const requestPasswordReset = async ({ email }, ctx) => {
     }
     queueMail({ to: email, ...emails.passwordReset(otp, env.PASSWORD_RESET_TTL_MINUTES) });
     audit.record(EVENTS.PASSWORD_RESET_REQUESTED, { userId: user.id, ctx });
+    return devOtp(otp);
 };
 
 const resetPassword = async ({ email, otp, newPassword }, ctx) => {
@@ -353,6 +381,7 @@ const requestEmailChange = async (auth, { newEmail, password }, ctx) => {
     const otp = await codes.issue(user.id, 'EMAIL_CHANGE', { ttlMinutes: env.EMAIL_CODE_TTL_MINUTES, target: newEmail });
     queueMail({ to: newEmail, ...emails.emailChange(otp, env.EMAIL_CODE_TTL_MINUTES) });
     audit.record(EVENTS.EMAIL_CHANGE_REQUESTED, { userId: user.id, ctx });
+    return devOtp(otp);
 };
 
 // Step 2: the code from the new inbox swaps the email and signs out other devices.
@@ -379,6 +408,11 @@ const confirmEmailChange = async (auth, { otp }, ctx) => {
 };
 
 module.exports = {
+    // shared with phoneAuthService
+    assertAvailable,
+    completeLogin,
+    devOtp,
+
     signup,
     login,
     loginWithGoogle,

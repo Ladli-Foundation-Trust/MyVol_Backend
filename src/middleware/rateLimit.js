@@ -53,6 +53,14 @@ const passwordResetLimiter = limiter({
     message: 'Too many password reset requests. Please try again in 15 minutes',
 });
 
+// Every SMS costs money, and "SMS pumping" fraud abuses send-code endpoints to text
+// premium numbers. Per-number caps live in phoneCodeService; this caps one network.
+const smsLimiter = limiter({
+    windowMinutes: 15,
+    limit: 20,
+    message: 'Too many codes requested from this network. Please try again in 15 minutes',
+});
+
 const usernameCheckLimiter = limiter({
     windowMinutes: 1,
     limit: 60,
@@ -68,12 +76,55 @@ const accountActionLimiter = limiter({
     message: 'Too many attempts. Please try again in 15 minutes',
 });
 
+// Per signed-in user. Mass follow/unfollow is the classic bot pattern.
+const followLimiter = limiter({
+    windowMinutes: 15,
+    limit: 100,
+    byUser: true,
+    message: 'You are following and unfollowing too fast. Please try again later',
+});
+
+const uploadLimiter = limiter({
+    windowMinutes: 60,
+    limit: 20,
+    byUser: true,
+    message: 'Too many uploads. Please try again later',
+});
+
+const postLimiter = limiter({
+    windowMinutes: 60,
+    limit: 30,
+    byUser: true,
+    message: 'You are posting too fast. Please try again later',
+});
+
+const commentLimiter = limiter({
+    windowMinutes: 15,
+    limit: 60,
+    byUser: true,
+    message: 'You are commenting too fast. Please try again later',
+});
+
+// Likes, saves, shares: generous, but stops scripts hammering counters.
+const engagementLimiter = limiter({
+    windowMinutes: 15,
+    limit: 300,
+    byUser: true,
+    message: 'Too many actions. Please slow down',
+});
+
 module.exports = {
     apiLimiter,
     loginLimiter,
     signupLimiter,
     refreshLimiter,
     passwordResetLimiter,
+    smsLimiter,
     usernameCheckLimiter,
     accountActionLimiter,
+    followLimiter,
+    uploadLimiter,
+    postLimiter,
+    commentLimiter,
+    engagementLimiter,
 };
