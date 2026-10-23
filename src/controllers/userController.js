@@ -1,5 +1,6 @@
 const profiles = require('../services/profileService');
 const follows = require('../services/followService');
+const blocks = require('../services/blockService');
 
 const ok = (res, data) => res.json({ status: 'success', data });
 
@@ -49,6 +50,15 @@ exports.following = async (req, res) => {
 exports.follow = async (req, res) => ok(res, await follows.follow(req.user.id, req.params.user));
 
 exports.unfollow = async (req, res) => ok(res, await follows.unfollow(req.user.id, req.params.user));
+
+// ---------- block & mute ----------
+
+exports.block = async (req, res) => ok(res, await blocks.block(req.user.id, req.params.user));
+exports.unblock = async (req, res) => ok(res, await blocks.unblock(req.user.id, req.params.user));
+exports.mute = async (req, res) => ok(res, await blocks.mute(req.user.id, req.params.user));
+exports.unmute = async (req, res) => ok(res, await blocks.unmute(req.user.id, req.params.user));
+exports.listBlocked = async (req, res) => ok(res, await blocks.listBlocked(req.user.id, req.validatedQuery));
+exports.listMuted = async (req, res) => ok(res, await blocks.listMuted(req.user.id, req.validatedQuery));
 
 exports.removeFollower = async (req, res) => {
     await follows.removeFollower(req.user.id, req.params.user);

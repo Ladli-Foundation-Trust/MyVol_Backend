@@ -1,8 +1,9 @@
 const prisma = require('../lib/prisma');
 const AppError = require('../utils/appError');
 const { afterCursor, toPage } = require('../utils/cursor');
-const { CARD_SELECT, relationsFor, toCard } = require('./socialGraph');
+const { CARD_SELECT, notBlockedWith, relationsFor, toCard } = require('./socialGraph');
 const { findVisiblePost } = require('./postService');
+const notifications = require('./notificationService');
 
 // Comments have one level of replies, like Instagram: replying to a reply attaches
 // to the same top-level comment. Threads read oldest first, like a conversation.
@@ -47,7 +48,8 @@ const toComments = async (viewerId, comments, postAuthorId) => {
 
 const pageOfComments = async (viewerId, where, postAuthorId, { cursor, limit }) => {
     const rows = await prisma.comment.findMany({
-        where: { ...where, author: { status: 'ACTIVE' }, ...afterCursor(cursor, 'id', 'asc') },
+        // Comments by people with a block between them and the viewer are hidden.
+        where: { ...where, author: { status: 'ACTIVE', ...notBlockedWith(viewerId) }, ...afterCursor(cursor, 'id', 'asc') },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         take: limit + 1,
         include: { author: { select: CARD_SELECT } },
@@ -71,14 +73,18 @@ const listReplies = async (viewerId, commentId, query) => {
 const addComment = async (viewerId, postId, { text, parentId }) => {
     const post = await findVisiblePost(viewerId, postId);
 
+    // Replying to a reply attaches to its top-level comment, but the notification goes
+    // to the author of the comment actually replied to.
     let topId = null;
+    let repliedToAuthorId = null;
     if (parentId) {
-        const parent = await prisma.comment.findFirst({ where: { id: parentId, postId }, select: { id: true, parentId: true } });
+        const parent = await prisma.comment.findFirst({ where: { id: parentId, postId }, select: { id: true, parentId: true, authorId: true } });
         if (!parent) throw commentNotFound();
         topId = parent.parentId ?? parent.id;
+        repliedToAuthorId = parent.authorId;
     }
 
-    const comment = await prisma.$transaction(async (tx) => {
+    const [comment, notificationIds] = await prisma.$transaction(async (tx) => {
         const created = await tx.comment.create({
             data: { postId, authorId: viewerId, parentId: topId, text },
             include: { author: { select: CARD_SELECT } },
@@ -87,20 +93,20 @@ const addComment = async (viewerId, postId, { text, parentId }) => {
         if (topId) {
             await tx.comment.update({ where: { id: topId }, data: { repliesCount: { increment: 1 } }, select: { id: true } });
         }
-        return created;
+        return [created, await notifications.commented(tx, viewerId, created, { postAuthorId: post.authorId, repliedToAuthorId })];
     });
+    notifications.deliver(notificationIds);
     return (await toComments(viewerId, [comment], post.authorId))[0];
 };
 
 // Deleting a top-level comment deletes its replies too (ON DELETE CASCADE). The
 // post's count is recounted rather than decremented, which also covers the replies.
-const deleteComment = async (viewerId, commentId) => {
-    const comment = await findComment(commentId);
-    if (comment.authorId !== viewerId && comment.post.authorId !== viewerId) {
-        throw new AppError("You can't delete this comment", 403, undefined, 'NOT_ALLOWED');
-    }
-
-    await prisma.$transaction(async (tx) => {
+// Used by the comment's author, the post's author and moderators (removeComment).
+const removeComment = async (comment) => {
+    const commentId = comment.id;
+    const changed = await prisma.$transaction(async (tx) => {
+        // Notifications about this comment and its replies go by cascade.
+        const recipients = await notifications.recipientsOf(tx, { comment: { OR: [{ id: commentId }, { parentId: commentId }] } });
         await tx.comment.delete({ where: { id: commentId } });
         const commentsCount = await tx.comment.count({ where: { postId: comment.postId } });
         await tx.post.update({ where: { id: comment.postId }, data: { commentsCount }, select: { id: true } });
@@ -110,30 +116,45 @@ const deleteComment = async (viewerId, commentId) => {
                 data: { repliesCount: { decrement: 1 } },
             });
         }
+        return recipients;
     });
+    notifications.syncCount(changed);
+};
+
+const deleteComment = async (viewerId, commentId) => {
+    const comment = await findComment(commentId);
+    if (comment.authorId !== viewerId && comment.post.authorId !== viewerId) {
+        throw new AppError("You can't delete this comment", 403, undefined, 'NOT_ALLOWED');
+    }
+    await removeComment(comment);
 };
 
 const setCommentLike = async (viewerId, commentId, like) => {
     const comment = await findComment(commentId);
     await findVisiblePost(viewerId, comment.postId);
 
-    const likesCount = await prisma.$transaction(async (tx) => {
+    const [likesCount, notificationId, changed] = await prisma.$transaction(async (tx) => {
         const { count } = like
             ? await tx.commentLike.createMany({ data: [{ userId: viewerId, commentId }], skipDuplicates: true })
             : await tx.commentLike.deleteMany({ where: { userId: viewerId, commentId } });
-        const row = count
-            ? await tx.comment.update({
-                  where: { id: commentId },
-                  data: { likesCount: { [like ? 'increment' : 'decrement']: 1 } },
-                  select: { likesCount: true },
-              })
-            : await tx.comment.findUnique({ where: { id: commentId }, select: { likesCount: true } });
-        return row.likesCount;
+        if (!count) return [(await tx.comment.findUnique({ where: { id: commentId }, select: { likesCount: true } })).likesCount];
+
+        const row = await tx.comment.update({
+            where: { id: commentId },
+            data: { likesCount: { [like ? 'increment' : 'decrement']: 1 } },
+            select: { likesCount: true },
+        });
+        if (!like) return [row.likesCount, null, await notifications.commentUnliked(tx, viewerId, comment)];
+        return [row.likesCount, await notifications.commentLiked(tx, viewerId, comment)];
     });
+    notifications.deliver(notificationId);
+    notifications.syncCount(changed);
     return { liked: like, likesCount };
 };
 
 module.exports = {
+    findComment,
+    removeComment,
     listComments,
     listReplies,
     addComment,

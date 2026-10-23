@@ -2,6 +2,8 @@ const env = require('./src/config/env');
 const app = require('./src/app');
 const prisma = require('./src/lib/prisma');
 const { runAuthCleanup } = require('./src/jobs/authCleanup');
+const realtime = require('./src/lib/realtime');
+const notifications = require('./src/services/notificationService');
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
@@ -21,7 +23,10 @@ const start = async () => {
 
     const server = app.listen(env.PORT, () => {
         console.log(`MyVolApp API on http://localhost:${env.PORT}/api/v1 (${env.NODE_ENV})`);
+        console.log(`Live notifications on ws://localhost:${env.PORT}${realtime.PATH}`);
     });
+    // The WebSocket shares the HTTP port; 'ready' tells a new connection its badge count.
+    const live = realtime.attach(server, { onReady: (user) => notifications.unreadCount(user.id) });
 
     cleanup();
     // unref: the timer alone must not keep the process alive during shutdown.
@@ -30,7 +35,9 @@ const start = async () => {
     const shutdown = (signal) => {
         console.log(`${signal} received, shutting down`);
         clearInterval(cleanupTimer);
+        live.close(); // the apps reconnect to the next server
         server.close(async () => {
+            await notifications.settle(); // let notifications already on their way finish
             await prisma.$disconnect();
             process.exit(0);
         });

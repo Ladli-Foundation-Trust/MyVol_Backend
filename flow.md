@@ -282,6 +282,81 @@ POST /:id/view     visible + has a video; author → no-op; tx { createMany post
                    skipDuplicates → views_count+1 | else plays+1, watch_ms+= }
 ```
 
+## 4e. Notifications (`/api/v1/notifications`, `/api/v1/settings`, live at `/api/v1/ws`)
+
+```
+an action (follow, like, comment, comment like, accept request)
+  followService / postService.react / commentService
+    prisma.$transaction(tx => {
+        ...the action's own writes (row + counters)...
+        notificationService.<event>(tx, ...)   createMany skipDuplicates on (recipient, dedupe_key)
+                                               → new id, or null (self-action / duplicate)
+        undo events (unlike, unfollow, decline) → delete by dedupe_key → recipients whose count changed
+        deleting a post/comment                → recipientsOf() first (their rows go by cascade)
+    })
+    notificationService.deliver(ids)           after commit; background (inFlight set)
+      sendOne(id)
+        notification gone? recipient not ACTIVE? → stop
+        recipient has no connected device?       → stop (the app catches up from the list on open)
+        alert = settings: pauseAll / 'off' / false → null
+                          'following' → recipient follows actor? else null
+                          same (recipient, dedupe_key) alerted < 1 h ago → null
+                          quiet hours → { sound: false, vibrate: false, channelId: 'silent' }
+        realtime.sendToUser(recipient, { type: 'notification', notification, unreadCount, alert })
+    notificationService.syncCount(userIds)     → { type: 'unread_count', unreadCount } to their devices
+
+lib/realtime.js  (server.js attaches it to the HTTP server; same port)
+  upgrade on /api/v1/ws (other paths → 404; browser Origin must be in CORS_ORIGINS)
+  first message { type: 'auth', token } (or Authorization header) → middleware/auth.authenticate()
+     ok → sockets[userId].add(ws) → { type: 'ready', userId, unreadCount }
+     bad → close 4401 <code>; nothing within 10 s → close 4408; > MAX_SESSIONS_PER_USER → 4429
+  every 30 s: ping (no pong since last time → terminate); sessions of all sockets in one query
+              → revoked / expired / user not ACTIVE → close 4401 SESSION_INVALID
+
+GET  /notifications            visible = recipient me AND (no actor OR actor ACTIVE)
+                               keyset on created_at desc, id desc; message built per row
+POST /:id/read, /read-all, DELETE /:id → also syncCount(me) so my other devices update
+PATCH /settings                INSERT … ON CONFLICT DO UPDATE SET data = data || patch (atomic merge)
+```
+
+## 4f. Block, mute, search, reports, moderation
+
+```
+socialGraph (every read of other people goes through these)
+  findActiveUser(:user, { viewerId })  + "they haven't blocked viewer" → else 404
+  notBlockedWith(viewer)               Prisma where: no block either way (spread into lists)
+  relationsFor(viewer, ids)            4 queries → followStatus, followsYou, blockedByMe, blocksMe
+  canView(viewer, user, rel)           own || (no block && (public || following))
+  isBlockedBetween(a, b, tx)           follow → 403 USER_BLOCKED; notificationService.record → skip
+
+POST /users/:user/block   tx { blocks createMany skipDuplicates → removeFollow both ways
+                                → delete follow_requests both ways → delete notifications between }
+                          → syncCount(both)
+POST /users/:user/mute    mutes createMany; feeds/explore/reels add author.mutesReceived none
+
+GET /search/users     raw SQL: ACTIVE, NOT EXISTS block, ILIKE '%q%' | % (trigram) on username/name/city
+                      ORDER BY exact, prefix, similarity, followers; LIMIT/OFFSET (cursor "o:<n>", ≤ 500)
+                      → users + relationsFor
+GET /search/posts     pageOfPosts(visibleTo(viewer) AND (title|description|location|category|
+                      author name ILIKE | hashtag contains)) — keyset like the feeds
+GET /search/hashtags  raw SQL on hashtags (posts_count > 0), offset cursor
+create/edit post      tx { … → setPostHashtags(extractHashtags(title, description)) → recount }
+
+POST /reports         reportLimiter → resolveTarget (must be visible to you, not yours)
+                      tx { open report by me on it? → return it (200)
+                           create → POST: distinct open reporters ≥ REPORT_AUTO_HIDE_THRESHOLD
+                                    → APPROVED→UNDER_REVIEW + moderation_actions AUTO_HIDE_POST }
+
+/admin/*              protect → restrictTo(REVIEWER, ADMIN) [→ restrictTo(ADMIN) for users/actions]
+  approve|reject      tx { post.status → log → close open reports on it (DISMISSED|RESOLVED)
+                           → postReviewed notification if the status changed } → deliver
+  remove comment      tx { log (with text) → close its reports } → commentService.removeComment
+  suspend             tx { SUSPENDED → revokeAllSessions → log → close USER reports }
+                      → realtime.disconnectUser
+  resolve report      remove → reject/removeComment; suspend → suspendUser (ADMIN);
+                      then close every open report on the same target + log
+```
+
 ## 5. Background job
 
 ```
@@ -296,6 +371,8 @@ jobs/authCleanup.runAuthCleanup
     delete refresh tokens expired, or used > 7 d ago
     delete codes          created > 1 d ago
     delete auth_events    older than 180 d
+    delete notifications  older than NOTIFICATION_RETENTION_DAYS (90)
+    recount hashtags.posts_count; delete unused hashtags older than 1 d
     (before purging users: subtract their follows from other users' counters, note which
      posts/comments they liked, saved or commented on; after the delete, recount those
      counters; after commit: delete their avatar and post photo files)
@@ -316,6 +393,15 @@ users ─┬─< posts ─┬─< post_media (position)       photos; key = stor
        │          ├─< post_saves (user_id, post_id)
        │          ├─< post_views (user_id, post_id)  plays, watch_ms; first play = a view
        │          └─< comments ─< comment_likes     comments.parent_id → top-level comment
+users ─┬─< notifications (recipient_id; actor_id, post_id, comment_id all cascade)
+       │       UNIQUE (recipient_id, dedupe_key)
+       ├─o user_settings (data JSONB)
+       ├─< blocks (blocker_id, blocked_id) / mutes (muter_id, muted_id)   PK pairs, cascade
+       ├─< reports (reporter_id; post_id/comment_id/user_id SET NULL, so reports outlive content)
+       └─< moderation_actions (moderator_id SET NULL; target_type + target_id, no FK: audit log)
+posts ─< post_hashtags >─ hashtags (name unique, posts_count)
+users.role: USER | REVIEWER | ADMIN. GIN trigram indexes: users.username/name, posts.title/description,
+hashtags.name (extension pg_trgm).
 users.followers_count / following_count, posts.likes/comments/saves/shares_count and
 comments.likes/replies_count are denormalised (CHECK >= 0).
 All child FKs: ON DELETE CASCADE → purging a user removes everything above.
@@ -333,11 +419,17 @@ phone_codes (no FK: keyed by number, the account may not exist yet), purged afte
 4. For Google: get an ID token with `@react-native-google-signin/google-signin`, POST it. On
    `PROFILE_REQUIRED`, ask for DOB + terms (and optionally a username), then POST again with the same token.
 5. Treat 403 `INVALID_PASSWORD` / `REAUTH_REQUIRED` as form errors, not logouts.
+6. Notifications: open the WebSocket after login and whenever the app returns to the foreground, send
+   `{ type: 'auth', token }`, close it on logout. On 4401 `TOKEN_EXPIRED` refresh and reconnect; other
+   closes → reconnect with backoff. Show `alert`s as local notifications (`expo-notifications`, channels
+   `default`, `sound-only`, `vibrate-only`, `silent`); on tap open `data.url` (README "Notifications").
 
 ## 8. Tests
 
 `test/helpers.js` (supertest app, `resetDb` guard for `*_test` databases, `lastCodeFor` reads codes from
 `mailer.outbox`, `lastSmsCodeFor` reads `sms.outbox`), `test/auth.test.js` (30 tests, one `describe`
 per flow above), `test/phone.test.js` (16 phone tests) , `test/users.test.js` (17 profile/follow
-tests) , `test/posts.test.js` (17 post/feed/comment tests) and `test/videos.test.js` (7 video/reel tests,
-clips generated with ffmpeg). Run `npm test`.
+tests) , `test/posts.test.js` (17 post/feed/comment tests), `test/videos.test.js` (7 video/reel tests,
+clips generated with ffmpeg) and `test/notifications.test.js` (31 tests: the WebSocket login/close codes/
+logout disconnect, every event type, undo, read/delete across devices, settings and banners, cleanup; it
+starts a real server on a random port and connects with a `ws` client like the app). Run `npm test`.

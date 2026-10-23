@@ -113,7 +113,34 @@ const engagementLimiter = limiter({
     message: 'Too many actions. Please slow down',
 });
 
+// "Send me a test notification" (a developer tool).
+const testNotificationLimiter = limiter({
+    windowMinutes: 15,
+    limit: 30,
+    byUser: true,
+    message: 'Too many test notifications. Please try again in 15 minutes',
+});
+
+// Search runs on every keystroke (debounced by the app); per user.
+const searchLimiter = limiter({
+    windowMinutes: 1,
+    limit: 90,
+    byUser: true,
+    message: 'Too many searches. Please slow down',
+});
+
+// Reports: plenty for real use, stops report-bombing scripts.
+const reportLimiter = limiter({
+    windowMinutes: 60,
+    limit: 30,
+    byUser: true,
+    message: 'Too many reports. Please try again later',
+});
+
 module.exports = {
+    searchLimiter,
+    reportLimiter,
+    testNotificationLimiter,
     apiLimiter,
     loginLimiter,
     signupLimiter,

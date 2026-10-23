@@ -46,6 +46,25 @@ const schema = z.object({
     MAX_POST_VIDEO_MB: z.coerce.number().positive().max(1024).default(100),
     MAX_VIDEO_SECONDS: z.coerce.number().int().positive().max(900).default(180),
 
+    // Notifications reach the app over our own WebSocket (lib/realtime.js), no push service.
+    // Quiet hours (22:00–07:00) are judged in this zone until users have their own.
+    DEFAULT_TIMEZONE: z
+        .string()
+        .default('Asia/Kolkata')
+        .refine((tz) => {
+            try {
+                new Intl.DateTimeFormat('en', { timeZone: tz });
+                return true;
+            } catch {
+                return false;
+            }
+        }, 'must be an IANA time zone such as Asia/Kolkata'),
+    NOTIFICATION_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+
+    // Moderation: an approved post reported by this many different people is hidden
+    // (back to UNDER_REVIEW) until a reviewer looks at it. 0 turns it off.
+    REPORT_AUTO_HIDE_THRESHOLD: z.coerce.number().int().min(0).default(5),
+
     // Google sign-in: every OAuth client ID whose ID tokens we accept (Android, iOS, web).
     GOOGLE_CLIENT_IDS: z.string().default(''),
 

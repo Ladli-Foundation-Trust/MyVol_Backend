@@ -1,4 +1,3 @@
-
 generator client {
   provider = "prisma-client-js"
   output   = "../src/generated/prisma"
@@ -46,6 +45,20 @@ enum AuthProvider {
   GOOGLE
 }
 
+// What a notification is about. The API sends these lower-cased with shorter names
+// (POST_LIKE → "like"); see notificationService.TYPE_NAMES.
+enum NotificationType {
+  FOLLOW
+  FOLLOW_REQUEST
+  FOLLOW_ACCEPTED
+  POST_LIKE
+  POST_COMMENT
+  COMMENT_REPLY
+  COMMENT_LIKE
+  POST_APPROVED
+  POST_REJECTED
+}
+
 model User {
   id                  String        @id @default(uuid()) @db.Uuid
   // Every account has an email, a phone, or both. Phone accounts may have no email.
@@ -87,19 +100,33 @@ model User {
   oauthAccounts     OAuthAccount[]
   authEvents        AuthEvent[]
   profile           Profile?
-  following         Follow[]        @relation("follower")
-  followers         Follow[]        @relation("following")
-  sentRequests      FollowRequest[] @relation("requester")
-  receivedRequests  FollowRequest[] @relation("target")
+  following         Follow[]           @relation("follower")
+  followers         Follow[]           @relation("following")
+  sentRequests      FollowRequest[]    @relation("requester")
+  receivedRequests  FollowRequest[]    @relation("target")
   posts             Post[]
   postLikes         PostLike[]
   postSaves         PostSave[]
   postViews         PostView[]
   comments          Comment[]
   commentLikes      CommentLike[]
+  notifications     Notification[]     @relation("recipient")
+  notificationsSent Notification[]     @relation("actor")
+  settings          UserSettings?
+  blocksMade        Block[]            @relation("blocker")
+  blocksReceived    Block[]            @relation("blocked")
+  mutesMade         Mute[]             @relation("muter")
+  mutesReceived     Mute[]             @relation("muted")
+  reportsMade       Report[]           @relation("reporter")
+  reportsReceived   Report[]           @relation("reportedUser")
+  reportsResolved   Report[]           @relation("resolver")
+  moderationActions ModerationAction[]
 
   @@index([status, deletionScheduledAt])
   @@index([phone])
+  // Search: trigram indexes make ILIKE '%word%' and similarity() fast (pg_trgm).
+  @@index([username(ops: raw("gin_trgm_ops"))], type: Gin, map: "users_username_trgm_idx")
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "users_name_trgm_idx")
   @@map("users")
 }
 
@@ -291,32 +318,38 @@ model Post {
   // (likes, comments) update the row too and must not look like an edit.
   editedAt        DateTime?  @map("edited_at")
 
-  author   User        @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  media    PostMedia[]
-  likes    PostLike[]
-  saves    PostSave[]
-  comments Comment[]
-  views    PostView[]
+  author        User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  media         PostMedia[]
+  likes         PostLike[]
+  saves         PostSave[]
+  comments      Comment[]
+  views         PostView[]
+  notifications Notification[]
+  reports       Report[]
+  hashtags      PostHashtag[]
 
   @@index([authorId, createdAt])
   @@index([isReel, status, createdAt])
   @@index([status, createdAt])
   @@index([category, status, createdAt])
+  // Search: trigram indexes make ILIKE '%word%' fast (pg_trgm).
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "posts_title_trgm_idx")
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "posts_description_trgm_idx")
   @@map("posts")
 }
 
 model PostMedia {
-  id        String    @id @default(uuid()) @db.Uuid
-  postId    String    @map("post_id") @db.Uuid
-  type      MediaType
+  id           String    @id @default(uuid()) @db.Uuid
+  postId       String    @map("post_id") @db.Uuid
+  type         MediaType
   // Storage key, like users.avatar_key (see lib/storage.js).
-  key       String
-  width     Int
-  height    Int
-  position  Int
+  key          String
+  width        Int
+  height       Int
+  position     Int
   // Videos only: the cover image (WebP) and length.
-  thumbnailKey String? @map("thumbnail_key")
-  durationMs   Int?    @map("duration_ms")
+  thumbnailKey String?   @map("thumbnail_key")
+  durationMs   Int?      @map("duration_ms")
 
   post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
 
@@ -379,11 +412,13 @@ model Comment {
   repliesCount Int      @default(0) @map("replies_count")
   createdAt    DateTime @default(now()) @map("created_at")
 
-  post    Post          @relation(fields: [postId], references: [id], onDelete: Cascade)
-  author  User          @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  parent  Comment?      @relation("replies", fields: [parentId], references: [id], onDelete: Cascade)
-  replies Comment[]     @relation("replies")
-  likes   CommentLike[]
+  post          Post           @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author        User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parent        Comment?       @relation("replies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies       Comment[]      @relation("replies")
+  likes         CommentLike[]
+  notifications Notification[]
+  reports       Report[]
 
   @@index([postId, parentId, createdAt])
   @@index([parentId, createdAt])
@@ -400,4 +435,203 @@ model CommentLike {
 
   @@id([userId, commentId])
   @@map("comment_likes")
+}
+
+// The Activity tab. One row per event, unique per (recipient, dedupe_key), so a double
+// tap or like→unlike→like can't stack duplicates; undoing the action (unlike, unfollow,
+// cancel request) deletes the row. Rows about a deleted post/comment/actor cascade away.
+// The message text is built at read time from the actor/post/comment, never stored.
+model Notification {
+  id          String           @id @default(uuid()) @db.Uuid
+  recipientId String           @map("recipient_id") @db.Uuid
+  // Null for system notifications (post approved/rejected).
+  actorId     String?          @map("actor_id") @db.Uuid
+  type        NotificationType
+  postId      String?          @map("post_id") @db.Uuid
+  commentId   String?          @map("comment_id") @db.Uuid
+  // e.g. "like:<postId>:<actorId>"; see notificationService.
+  dedupeKey   String           @map("dedupe_key")
+  readAt      DateTime?        @map("read_at")
+  createdAt   DateTime         @default(now()) @map("created_at")
+
+  recipient User     @relation("recipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  actor     User?    @relation("actor", fields: [actorId], references: [id], onDelete: Cascade)
+  post      Post?    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  comment   Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@unique([recipientId, dedupeKey])
+  // The list (newest first) and the unread count.
+  @@index([recipientId, createdAt])
+  @@index([recipientId, readAt])
+  // Cascading deletes look these up.
+  @@index([actorId])
+  @@index([postId])
+  @@index([commentId])
+  @@map("notifications")
+}
+
+// App settings as one JSONB object of flat keys matching the app's settingsSlice
+// (pauseAll, notifLikes...). Missing keys fall back to defaults in settingsService,
+// so adding a setting needs no migration. Only the notification keys exist so far;
+// the settings phase adds the rest.
+model UserSettings {
+  userId    String   @id @map("user_id") @db.Uuid
+  data      Json     @default("{}")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+// A blocks B: B can't find A (404), see A's posts or comments, follow or contact A.
+// A still sees B's profile (to unblock) but none of B's content. Blocking removes
+// follows and follow requests both ways (blockService). Directional: the row says who
+// did it, the rule applies both ways (socialGraph.notBlockedWith).
+model Block {
+  blockerId String   @map("blocker_id") @db.Uuid
+  blockedId String   @map("blocked_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  blocker User @relation("blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@id([blockerId, blockedId])
+  @@index([blockedId])
+  @@index([blockerId, createdAt])
+  @@map("blocks")
+}
+
+// A mutes B: B's posts leave A's home feed, explore and reels. B is not told and can
+// still see A. Nothing else changes (they can still follow each other).
+model Mute {
+  muterId   String   @map("muter_id") @db.Uuid
+  mutedId   String   @map("muted_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  muter User @relation("muter", fields: [muterId], references: [id], onDelete: Cascade)
+  muted User @relation("muted", fields: [mutedId], references: [id], onDelete: Cascade)
+
+  @@id([muterId, mutedId])
+  @@index([mutedId])
+  @@index([muterId, createdAt])
+  @@map("mutes")
+}
+
+enum ReportType {
+  POST
+  COMMENT
+  USER
+  // The app's "Report a problem" form (bugs, account issues, ideas): no target.
+  PROBLEM
+}
+
+enum ReportReason {
+  SPAM
+  NUDITY
+  HATE_SPEECH
+  HARASSMENT
+  VIOLENCE
+  SELF_HARM
+  FALSE_INFORMATION
+  SCAM
+  INTELLECTUAL_PROPERTY
+  FAKE_ACCOUNT
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  // A moderator acted (removed the content, suspended the user, fixed the problem).
+  RESOLVED
+  // Looked at, no violation.
+  DISMISSED
+}
+
+// Reports are anonymous to the reported person. One OPEN report per reporter and
+// target (reportService). A report outlives its target (SET NULL), so the record of
+// what was reported and what was done stays.
+model Report {
+  id           String        @id @default(uuid()) @db.Uuid
+  reporterId   String        @map("reporter_id") @db.Uuid
+  type         ReportType
+  reason       ReportReason?
+  // PROBLEM reports: the app's category (bug, content, account, idea).
+  category     String?
+  details      String?
+  // PROBLEM reports: "app v1.0.0, Android 14" if the user allowed it.
+  deviceInfo   String?       @map("device_info")
+  postId       String?       @map("post_id") @db.Uuid
+  commentId    String?       @map("comment_id") @db.Uuid
+  // USER reports: the reported account. POST/COMMENT reports: the content's author.
+  userId       String?       @map("user_id") @db.Uuid
+  status       ReportStatus  @default(OPEN)
+  resolvedById String?       @map("resolved_by_id") @db.Uuid
+  resolvedAt   DateTime?     @map("resolved_at")
+  // What the moderator did: dismiss | resolve | remove | suspend, plus their note.
+  resolution   String?
+  createdAt    DateTime      @default(now()) @map("created_at")
+
+  reporter   User     @relation("reporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  user       User?    @relation("reportedUser", fields: [userId], references: [id], onDelete: SetNull)
+  resolvedBy User?    @relation("resolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  post       Post?    @relation(fields: [postId], references: [id], onDelete: SetNull)
+  comment    Comment? @relation(fields: [commentId], references: [id], onDelete: SetNull)
+
+  // The moderation queue: open reports of a type, oldest first.
+  @@index([status, type, createdAt])
+  @@index([postId, status])
+  @@index([commentId, status])
+  @@index([userId, status])
+  @@index([reporterId, createdAt])
+  @@map("reports")
+}
+
+// Append-only log of what staff (and the automatic report threshold) did, for
+// accountability and appeals. moderator_id is null for automatic actions.
+model ModerationAction {
+  id          String   @id @default(uuid()) @db.Uuid
+  moderatorId String?  @map("moderator_id") @db.Uuid
+  // APPROVE_POST, REJECT_POST, AUTO_HIDE_POST, DELETE_COMMENT, SUSPEND_USER,
+  // UNSUSPEND_USER, SET_ROLE, DISMISS_REPORT, RESOLVE_REPORT
+  action      String
+  // post | comment | user | report
+  targetType  String   @map("target_type")
+  targetId    String   @map("target_id") @db.Uuid
+  reason      String?
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  moderator User? @relation(fields: [moderatorId], references: [id], onDelete: SetNull)
+
+  @@index([targetType, targetId, createdAt])
+  @@index([moderatorId, createdAt])
+  @@index([createdAt])
+  @@map("moderation_actions")
+}
+
+// #tags found in a post's title and description (lower-cased, without '#').
+// posts_count is kept by postService and recounted by the cleanup job.
+model Hashtag {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String   @unique
+  postsCount Int      @default(0) @map("posts_count")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  posts PostHashtag[]
+
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "hashtags_name_trgm_idx")
+  @@map("hashtags")
+}
+
+model PostHashtag {
+  postId    String @map("post_id") @db.Uuid
+  hashtagId String @map("hashtag_id") @db.Uuid
+
+  post    Post    @relation(fields: [postId], references: [id], onDelete: Cascade)
+  hashtag Hashtag @relation(fields: [hashtagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, hashtagId])
+  @@index([hashtagId, postId])
+  @@map("post_hashtags")
 }

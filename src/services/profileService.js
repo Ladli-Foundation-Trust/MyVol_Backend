@@ -38,9 +38,10 @@ const formatDate = (d) => (d ? d.toISOString().slice(0, 10) : null);
 // One shape for every profile view. `details` is null when the viewer can't see the
 // account (private, not following). Gender, DOB and education are added only for the
 // owner, or when the owner turned on showPersonalDetails.
-const toProfile = (user, viewerId, { followStatus, followsYou }, postsCount) => {
+const toProfile = (user, viewerId, relation, postsCount) => {
+    const { followStatus, followsYou } = relation;
     const isMe = user.id === viewerId;
-    const visible = canView(viewerId, user, followStatus);
+    const visible = canView(viewerId, user, relation);
     const p = user.profile ?? {};
     const showPersonal = isMe || Boolean(p.showPersonalDetails);
 
@@ -172,11 +173,22 @@ const removeAvatar = async (userId) => {
 
 // ---------- other people ----------
 
+// Someone who blocked you is a 404 (findActiveUser). Someone you blocked shows with
+// blockedByMe: true and no content, so the app can offer "Unblock".
 const getProfile = async (viewerId, idOrUsername) => {
-    const user = await findActiveUser(idOrUsername, PROFILE_SELECT);
+    const user = await findActiveUser(idOrUsername, { viewerId, select: PROFILE_SELECT });
     if (user.id === viewerId) return getMe(viewerId);
-    const [rel, postsCount] = await Promise.all([relationsFor(viewerId, [user.id]), countPosts(user.id, false)]);
-    return toProfile(user, viewerId, rel(user.id), postsCount);
+    const [rel, postsCount, muted] = await Promise.all([
+        relationsFor(viewerId, [user.id]),
+        countPosts(user.id, false),
+        prisma.mute.count({ where: { muterId: viewerId, mutedId: user.id } }),
+    ]);
+    const relation = rel(user.id);
+    return {
+        ...toProfile(user, viewerId, relation, relation.blockedByMe ? 0 : postsCount),
+        blockedByMe: relation.blockedByMe,
+        mutedByMe: muted > 0,
+    };
 };
 
 module.exports = { getMe, updateMe, changeUsername, setAvatar, removeAvatar, getProfile };

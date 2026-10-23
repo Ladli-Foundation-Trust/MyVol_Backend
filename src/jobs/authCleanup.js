@@ -1,3 +1,4 @@
+const env = require('../config/env');
 const prisma = require('../lib/prisma');
 const storage = require('../lib/storage');
 
@@ -83,6 +84,18 @@ const purgeDatabase = () =>
             const events = await tx.authEvent.deleteMany({
                 where: { createdAt: { lt: daysAgo(AUTH_EVENT_RETENTION_DAYS) } },
             });
+            const notifications = await tx.notification.deleteMany({
+                where: { createdAt: { lt: daysAgo(env.NOTIFICATION_RETENTION_DAYS) } },
+            });
+            // Purged users' posts took their hashtag links with them: fix the counts and
+            // drop tags no post uses any more.
+            await tx.$executeRaw`
+                UPDATE hashtags h SET posts_count = c.n
+                FROM (SELECT h2.id, count(ph.post_id)::int AS n
+                      FROM hashtags h2 LEFT JOIN post_hashtags ph ON ph.hashtag_id = h2.id
+                      GROUP BY h2.id) c
+                WHERE h.id = c.id AND h.posts_count <> c.n`;
+            const hashtags = await tx.hashtag.deleteMany({ where: { postsCount: 0, createdAt: { lt: daysAgo(1) } } });
 
             return {
                 purgedUsers: users.count,
@@ -91,6 +104,8 @@ const purgeDatabase = () =>
                 codes: codes.count,
                 phoneCodes: phoneCodes.count,
                 events: events.count,
+                notifications: notifications.count,
+                hashtags: hashtags.count,
                 fileKeys: [...avatars.map((a) => a.avatarKey), ...postMedia.flatMap((m) => [m.key, m.thumbnailKey].filter(Boolean))],
             };
         },

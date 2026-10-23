@@ -6,16 +6,11 @@ const SESSION_ENDED = 'Your session has ended. Please log in again';
 
 // Verifies the access token, then checks its session and user in one query, so a
 // logout, password change, ban or role change takes effect on the very next request
-// instead of when the 15-minute token expires.
-const protect = async (req, res, next) => {
-    const header = req.get('authorization') || '';
-    const [scheme, token] = header.split(' ');
-    if (scheme !== 'Bearer' || !token) {
-        return next(new AppError('You are not logged in', 401, undefined, 'NOT_AUTHENTICATED'));
-    }
-
-    const payload = verifyAccessToken(token); // throws → 401 TOKEN_EXPIRED / TOKEN_INVALID via errorHandler
-    if (!payload.sid) return next(new AppError(SESSION_ENDED, 401, undefined, 'SESSION_INVALID'));
+// instead of when the 15-minute token expires. Used by `protect` and by the WebSocket
+// login (lib/realtime.js). Throws AppError 401 (or a JWT error → TOKEN_EXPIRED/TOKEN_INVALID).
+const authenticate = async (token) => {
+    const payload = verifyAccessToken(token);
+    if (!payload.sid) throw new AppError(SESSION_ENDED, 401, undefined, 'SESSION_INVALID');
 
     const session = await prisma.session.findUnique({
         where: { id: payload.sid },
@@ -27,13 +22,13 @@ const protect = async (req, res, next) => {
         },
     });
     if (!session || session.revokedAt || session.userId !== payload.sub) {
-        return next(new AppError(SESSION_ENDED, 401, undefined, 'SESSION_INVALID'));
+        throw new AppError(SESSION_ENDED, 401, undefined, 'SESSION_INVALID');
     }
     if (session.user.status !== 'ACTIVE') {
-        return next(new AppError(SESSION_ENDED, 401, undefined, 'ACCOUNT_INACTIVE'));
+        throw new AppError(SESSION_ENDED, 401, undefined, 'ACCOUNT_INACTIVE');
     }
 
-    req.user = {
+    return {
         id: session.user.id,
         role: session.user.role, // from the DB, not the token, so demotions apply at once
         // A verified email or any phone (phones are only saved after an SMS code).
@@ -41,6 +36,15 @@ const protect = async (req, res, next) => {
         sessionId: payload.sid,
         sessionCreatedAt: session.createdAt,
     };
+};
+
+const protect = async (req, res, next) => {
+    const header = req.get('authorization') || '';
+    const [scheme, token] = header.split(' ');
+    if (scheme !== 'Bearer' || !token) {
+        return next(new AppError('You are not logged in', 401, undefined, 'NOT_AUTHENTICATED'));
+    }
+    req.user = await authenticate(token);
     next();
 };
 
@@ -63,4 +67,4 @@ const restrictTo =
         next();
     };
 
-module.exports = { protect, requireVerified, restrictTo };
+module.exports = { authenticate, protect, requireVerified, restrictTo };

@@ -372,22 +372,160 @@ trending) can be added later without a migration. The feed is chronological unti
 follows, 5 reels (ffmpeg test patterns, or your own clips with `--videos`), photo posts, a carousel, likes,
 comments and views, all through the real services. `--reset` removes them via the normal purge.
 
+### D44. Notifications: one row per event, de-duplicated, undone with the action (2026-10-22)
+**Decision.** `notifications` has a `dedupe_key` unique per recipient (`like:<post>:<actor>`,
+`follow:<actor>`, `comment:<comment>`...). The follow/post/comment services record notifications **inside
+their own transaction**, so a like and its notification commit or roll back together. Undoing the action
+deletes the row (unlike, unfollow, cancelled/declined request). Deleted posts, comments and users take
+theirs with them through `ON DELETE CASCADE`. A follow request and the follow it becomes share one key:
+accepting changes the row's type (and marks it read) instead of adding a second one. No message text is
+stored: it is built at read time from the actor, post and comment.
+**Why.** Without the unique key, a double tap or a like→unlike→like loop floods the Activity tab. With
+stored text, a renamed user or a deleted comment would leave stale or leaked content behind.
+**Trade-off.** No Instagram-style grouping ("Priya and 12 others liked…") yet. It can be done at read
+time over the same rows when volumes call for it.
+
+### D45. Settings control the phone banner, not the Activity list
+**Decision.** `pauseAll`, `notifLikes`/`notifComments` (`off`/`following`/`everyone`) and the boolean
+toggles only decide whether the app shows a phone notification: the server sends `alert: null` or
+`{ sound, vibrate, channelId }` with every live event, and the app obeys. The in-app list always records
+everything. Quiet hours (22:00–07:00 in `DEFAULT_TIMEZONE`) use the `silent` channel instead of dropping the
+banner. Sound and vibration choose one of four Android channels, because Android 8+ fixes them per channel.
+**Why.** This matches Instagram and the app's own copy ("Pause all: temporarily stop push notifications").
+Users can't miss activity by toggling a setting. Keeping the rules on the server means they're tested once
+and every client (Android, iOS, web later) behaves the same.
+
+### D46. Settings stored as one JSONB object with the app's keys
+**Decision.** `user_settings.data` is JSONB with the same flat keys as the app's `settingsSlice`. Defaults
+live in `settingsService` and are merged at read time. PATCH merges with `jsonb ||` in one statement.
+Only the notification keys are accepted for now; Phase 12 adds the rest to the same table and endpoint.
+**Why.** The plan already calls for JSONB settings (Phase 12), and building the table now avoids a second
+endpoint. A new setting needs a default and a validator entry, not a migration. The atomic merge stops two
+devices from overwriting each other's changes.
+
+### D47. Our own WebSocket instead of a push service (no Firebase)
+**Decision.** At the product owner's request, no Firebase/FCM, APNs or Expo push service. Live delivery is a
+WebSocket on the API's own port (`/api/v1/ws`, `lib/realtime.js` on the `ws` protocol library; everything
+above the protocol is ours). The app sends its access token as the first message (never in the URL, which
+gets logged), checked by the same `authenticate()` as `protect`. Sockets are kept per user (one per device,
+capped at `MAX_SESSIONS_PER_USER`). A 30 s heartbeat drops dead connections and re-checks every socket's
+session in one query, so logout, "log out of all devices", password change and bans disconnect the device
+(the socket outlives its 15-minute access token). Events: `ready` (with the unread count), `notification`
+(the list item + `unreadCount` + `alert`), `unread_count` (after undo, read or delete, so a user's other
+devices stay in step). Sends happen in the background after the transaction commits (`deliver()` /
+`syncCount()`). A like→unlike→like within an hour shows only one banner (in-memory guard).
+**Why.** It needs no third-party account, works on localhost over USB, and is the connection chat (Phase 14)
+needs anyway.
+**Trade-off.** Android and iOS only let FCM/APNs wake a closed app, so **a closed or suspended app gets
+nothing until it is opened again** (then `ready` + the list catch it up). If background delivery is ever
+wanted, FCM/APNs can be added next to the socket: only `notificationService.sendOne` would change.
+Connections and the banner guard live in one process's memory; with several instances, `sendToUser` needs a
+Redis pub/sub fan-out.
+
+### D48. Retention
+**Decision.** Notifications older than `NOTIFICATION_RETENTION_DAYS` (90) are deleted by the cleanup job.
+**Why.** Nobody scrolls back further than that, and it keeps the table and its indexes small.
+
+### D49. Block is two-way and enforced in socialGraph; mute only trims feeds (2026-10-23)
+**Decision.** `blocks` and `mutes` are (from, to) pairs. A block works **both ways** once either side
+blocks: `findActiveUser(…, { viewerId })` 404s someone who blocked you, `canView` is false across a block,
+and `notBlockedWith(viewerId)` is spread into every list of other people (followers, likes, comments,
+requests, feeds, search). `findVisiblePost` 404s posts across a block. Blocking deletes follows and follow
+requests both ways (with counters) and the notifications between them, in one transaction;
+`notificationService` records nothing across a block. Old likes/comments stay but are hidden from each
+other. Someone *you* blocked is still found (profile with `blockedByMe: true`, no content) so the app can
+offer "Unblock"; following them answers 403 `USER_BLOCKED`. Neither person is told. Mute removes the muted
+person's posts from home, explore and reels only; profile, links and search still show them.
+**Why.** This is Instagram's model, which the app copies. Putting the rule in the shared building blocks
+means posts, comments, notifications and search can't each forget it.
+**Trade-off.** Each list query carries two `NOT EXISTS` sub-queries; `blocks` is indexed on both columns.
+Unblocking does not restore the follows.
+
+### D50. Search with pg_trgm, not a search engine
+**Decision.** `pg_trgm` (a trusted extension, so the app role can create it in the migration) with GIN
+trigram indexes on `users.username/name`, `posts.title/description` and `hashtags.name`. People and hashtags
+match `ILIKE '%q%'` or similarity (`%`, so "priyaa" finds "priya") and are ranked exact → prefix →
+similarity → popularity; they page by offset behind an opaque cursor (`o:<n>`, max 500). Posts
+("Activities") match title, description, location, category, author name or hashtag, go through the same
+`visibleTo` rule as the feeds, and page newest-first with the feeds' keyset cursor. A leading `@`/`#` in
+`q` is ignored. `searchLimiter`: 90/min per user (the app searches while typing).
+**Why.** The plan names pg_trgm. It is fast enough for this size, needs no second system to keep in sync,
+and respects blocks and privacy because it is plain SQL over the same tables.
+**Trade-off.** No stemming or Hindi transliteration. Relevance pages can shift slightly as data changes
+(offset paging). Move to Postgres full-text or OpenSearch if search quality becomes a complaint.
+
+### D51. Hashtags parsed from the text and stored as rows
+**Decision.** `extractHashtags` reads `#tag` from title + description (letters of any script **including
+combining marks**, digits, `_`; ≤50 chars, lower-cased, ≤30 per post) on create and edit, inside the post's
+transaction. `hashtags.posts_count` is recounted from `post_hashtags` for the tags that changed; the
+cleanup job recounts after purges and deletes unused tags older than a day. `GET /hashtags/:tag/posts` is
+the tag page (only posts the viewer may see; `postsCount` counts all).
+**Why.** Without `\p{M}`, Hindi vowel signs split tags ("#स्वच्छता" → "#स"). Stored rows make tag search and
+tag pages index lookups instead of scanning post text.
+
+### D52. Roles from the database; the first admin from the command line
+**Decision.** `users.role` is `USER | REVIEWER | ADMIN`. `/api/v1/admin` is behind
+`protect, restrictTo('REVIEWER','ADMIN')`; suspending, unsuspending, changing roles and the audit log are
+ADMIN only. `protect` reads the role from the DB on every request, so a demotion applies at once. The first
+admin is made with `npm run user:role -- <username|email> ADMIN`; nobody can change their own role or
+suspend themselves, and an admin can't be suspended until demoted.
+**Why.** No sign-up path can ever grant a role. Self-changes are blocked so the last admin can't lock
+everyone out by accident.
+
+### D53. Reports: anonymous, de-duplicated, auto-hide at a threshold
+**Decision.** `POST /reports` takes `type` (post/comment/user), `targetId`, `reason` (11 fixed reasons) and
+optional `details`; you can report only what you can see, never yourself, and a repeat while your report is
+open returns the same report (200, `alreadyReported: true`). `POST /reports/problem` is the app's "Report a
+problem" screen (bug/content/account/idea + device info). Reports keep their row when the content is
+deleted (`ON DELETE SET NULL`). An approved post reported by `REPORT_AUTO_HIDE_THRESHOLD` (5) **distinct**
+people goes back to `UNDER_REVIEW` (hidden) and is logged as `AUTO_HIDE_POST` with no moderator.
+`reportLimiter`: 30/hour per user.
+**Why.** Anonymity protects reporters from retaliation. Distinct reporters stop one person from hiding a
+post alone; the threshold limits harm while no reviewer is online.
+**Trade-off.** A coordinated group of 5 can hide a post until a reviewer restores it. Approving it dismisses
+those reports, and the audit log shows who reported.
+
+### D54. Moderation actions close every report on the same target, and are audited
+**Decision.** Reviewers work two queues, oldest first: posts by status (with open-report counts and
+reasons) and reports. `approve` / `reject` (reason required) a post; `remove` a comment; `resolve` a report
+with `dismiss | resolve | remove | suspend` (suspend is ADMIN only). Every action writes
+`moderation_actions` (who, what, why, metadata such as a removed comment's text) and closes **all** open
+reports about the same target in the same transaction. Moderators see every post regardless of privacy.
+A status change calls `notificationService.postReviewed` (the approved/rejected notification). Editing a
+rejected post sends it back to review: that is how an author appeals.
+**Why.** One decision should clear the queue for that item, not leave five copies for the next reviewer.
+The audit log answers "who removed this and why" for appeals and for checking the moderators themselves.
+
+### D55. Suspension ends everything at once
+**Decision.** `POST /admin/users/:id/suspend` sets `SUSPENDED`, revokes all sessions and closes the user's
+live WebSockets (`realtime.disconnectUser`) in the same request. The existing rules then hide their profile,
+posts and comments and make login answer 403 `ACCOUNT_SUSPENDED`. Unsuspend restores `ACTIVE`; the user logs
+in again.
+**Why.** A suspended account must not keep posting with an access token that is still valid for 15 minutes,
+or keep receiving live events.
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|
 | Two-factor auth (TOTP + backup codes) | No UI in the app yet. Recommended before public launch, at least for staff/moderator roles. |
 | Sign in with Apple | Required by App Store rules if Google sign-in ships on iOS. Android-first for now. |
 | Real SMS delivery | Phone auth is built (D30) but codes go to the console. Needs a provider (MSG91 etc.) and a DLT-registered sender in India. |
-| Block / mute, suggested volunteers | Phase 8. Plug block checks into `socialGraph` (findActiveUser/canView). |
+| Suggested volunteers | Rest of Phase 8. Must use `notBlockedWith` (D49). |
+| Impact stats and medal tiers (Bronze 3 / Silver 6 / Gold 12 / Platinum 25) | Rest of Phase 9. Hours and beneficiaries are already stored on posts. |
+| Who can comment / who can message you | Privacy settings. Blocks already stop both (D49). |
+| Turning off `POST_AUTO_APPROVE` | Moderation exists now (D54). It stays on until a reviewer is ready to work the queue; with it off, new posts start Under Review. |
+| Web admin panel | Staff use the `/admin` API through Postman for now (plan: "Later"). |
 | Cloud video (HLS, background processing) | Local ffmpeg for now (D41). |
 | Reels ranking | Chronological; watch time is already recorded (D42). |
 | Feed ranking / "Near me" / trending | Chronological is enough for now (D39). |
-| Reporting posts/comments, approve/reject | Moderation phase. Set `POST_AUTO_APPROVE=false` then (D37). |
-| Follow notifications | Phase 10 (notifications). The follow/accept code paths are the hook points. |
+| Mention notifications | No @mentions yet. `notifMentions` is already stored (D46). |
+| Grouped notifications ("X and 12 others") | Read-time grouping over the same rows when needed (D44). |
+| Notifications while the app is closed | Needs FCM/APNs, declined for now (D47). The app catches up on open. |
+| Multi-instance WebSocket fan-out (Redis pub/sub) | One instance for now (D47). |
+| Per-user time zone for quiet hours | `DEFAULT_TIMEZONE` until settings have a time zone (D45). |
 | S3/CDN storage | Swap `src/lib/storage.js` when a bucket exists (D34). |
 | Removing a phone / freeing a slot | Not needed yet. Deleting the account frees the slot after the grace period. |
 | "New login from X" emails | Needs device fingerprinting to avoid spam. The audit log already has the data. |
-| Admin suspend/unsuspend endpoints | Belongs to the moderation phase. The `SUSPENDED` status is already enforced everywhere. |
 | Breached-password check (HIBP) | See D24. |
 | Redis-backed rate limits | Only needed once there is more than one instance (D22). |
 | CAPTCHA / Play Integrity on signup | Add if bot sign-ups show up in `auth_events`. |

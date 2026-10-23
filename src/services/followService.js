@@ -1,7 +1,8 @@
 const prisma = require('../lib/prisma');
 const AppError = require('../utils/appError');
 const { afterCursor, toPage } = require('../utils/cursor');
-const { CARD_SELECT, findActiveUser, relationsFor, canView, toCard } = require('./socialGraph');
+const notifications = require('./notificationService');
+const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, isBlockedBetween, toCard } = require('./socialGraph');
 
 // ---------- the only code that writes follows (keeps the counters right) ----------
 
@@ -26,6 +27,7 @@ const acceptAllRequests = async (tx, userId) => {
     const requests = await tx.followRequest.findMany({ where: { targetId: userId }, select: { requesterId: true } });
     for (const { requesterId } of requests) await addFollow(tx, requesterId, userId);
     await tx.followRequest.deleteMany({ where: { targetId: userId } });
+    await notifications.allRequestsAccepted(tx, userId);
 };
 
 // ---------- actions ----------
@@ -33,30 +35,36 @@ const acceptAllRequests = async (tx, userId) => {
 // Public account: follows at once. Private account: leaves a request. Repeating
 // the call is harmless and returns the current state.
 const follow = async (viewerId, idOrUsername) => {
-    const target = await findActiveUser(idOrUsername);
+    const target = await findActiveUser(idOrUsername, { viewerId }); // 404 if they blocked you
     if (target.id === viewerId) throw new AppError("You can't follow yourself", 400, undefined, 'CANNOT_FOLLOW_SELF');
+    if (await isBlockedBetween(viewerId, target.id)) {
+        throw new AppError('Unblock this account to follow it', 403, undefined, 'USER_BLOCKED');
+    }
 
-    const followStatus = await prisma.$transaction(async (tx) => {
+    const { followStatus, notificationId } = await prisma.$transaction(async (tx) => {
         const pair = { followerId_followingId: { followerId: viewerId, followingId: target.id } };
-        if (await tx.follow.findUnique({ where: pair, select: { createdAt: true } })) return 'following';
+        if (await tx.follow.findUnique({ where: pair, select: { createdAt: true } })) return { followStatus: 'following' };
 
         if (target.isPrivate) {
             await tx.followRequest.createMany({ data: [{ requesterId: viewerId, targetId: target.id }], skipDuplicates: true });
-            return 'requested';
+            return { followStatus: 'requested', notificationId: await notifications.followRequested(tx, viewerId, target.id) };
         }
         await addFollow(tx, viewerId, target.id);
-        return 'following';
+        return { followStatus: 'following', notificationId: await notifications.followed(tx, viewerId, target.id) };
     });
+    notifications.deliver(notificationId);
     return { followStatus };
 };
 
 // Unfollow, or cancel a pending request. Harmless if neither exists.
 const unfollow = async (viewerId, idOrUsername) => {
     const target = await findActiveUser(idOrUsername);
-    await prisma.$transaction(async (tx) => {
+    const changed = await prisma.$transaction(async (tx) => {
         await removeFollow(tx, viewerId, target.id);
         await tx.followRequest.deleteMany({ where: { requesterId: viewerId, targetId: target.id } });
+        return notifications.followRemoved(tx, viewerId, target.id);
     });
+    notifications.syncCount(changed);
     return { followStatus: 'none' };
 };
 
@@ -67,25 +75,32 @@ const removeFollower = async (viewerId, idOrUsername) => {
 };
 
 const acceptRequest = async (viewerId, requesterId) => {
-    await prisma.$transaction(async (tx) => {
+    const notificationId = await prisma.$transaction(async (tx) => {
         const { count } = await tx.followRequest.deleteMany({ where: { requesterId, targetId: viewerId } });
         if (count === 0) throw new AppError('Follow request not found', 404, undefined, 'REQUEST_NOT_FOUND');
         await addFollow(tx, requesterId, viewerId);
+        return notifications.requestAccepted(tx, requesterId, viewerId);
     });
+    notifications.deliver(notificationId);
+    notifications.syncCount(viewerId); // their request notification is now read
 };
 
 const declineRequest = async (viewerId, requesterId) => {
-    const { count } = await prisma.followRequest.deleteMany({ where: { requesterId, targetId: viewerId } });
-    if (count === 0) throw new AppError('Follow request not found', 404, undefined, 'REQUEST_NOT_FOUND');
+    const changed = await prisma.$transaction(async (tx) => {
+        const { count } = await tx.followRequest.deleteMany({ where: { requesterId, targetId: viewerId } });
+        if (count === 0) throw new AppError('Follow request not found', 404, undefined, 'REQUEST_NOT_FOUND');
+        return notifications.followRemoved(tx, requesterId, viewerId);
+    });
+    notifications.syncCount(changed);
 };
 
 // ---------- lists (newest first, cursor-paginated) ----------
 
 // mode 'followers': people who follow `idOrUsername`; 'following': people they follow.
 const listFollows = async (viewerId, idOrUsername, mode, { cursor, limit }) => {
-    const user = await findActiveUser(idOrUsername);
+    const user = await findActiveUser(idOrUsername, { viewerId });
     const rel = await relationsFor(viewerId, [user.id]);
-    if (!canView(viewerId, user, rel(user.id).followStatus)) {
+    if (!canView(viewerId, user, rel(user.id))) {
         throw new AppError('This account is private', 403, undefined, 'PRIVATE_ACCOUNT');
     }
 
@@ -95,7 +110,7 @@ const listFollows = async (viewerId, idOrUsername, mode, { cursor, limit }) => {
     const otherUser = followers ? 'follower' : 'following';
 
     const rows = await prisma.follow.findMany({
-        where: { [ownSide]: user.id, [otherUser]: { status: 'ACTIVE' }, ...afterCursor(cursor, otherSide) },
+        where: { [ownSide]: user.id, [otherUser]: { status: 'ACTIVE', ...notBlockedWith(viewerId) }, ...afterCursor(cursor, otherSide) },
         orderBy: [{ createdAt: 'desc' }, { [otherSide]: 'desc' }],
         take: limit + 1,
         select: { createdAt: true, [otherSide]: true, [otherUser]: { select: CARD_SELECT } },
@@ -108,7 +123,7 @@ const listFollows = async (viewerId, idOrUsername, mode, { cursor, limit }) => {
 
 const listRequests = async (viewerId, { cursor, limit }) => {
     const rows = await prisma.followRequest.findMany({
-        where: { targetId: viewerId, requester: { status: 'ACTIVE' }, ...afterCursor(cursor, 'requesterId') },
+        where: { targetId: viewerId, requester: { status: 'ACTIVE', ...notBlockedWith(viewerId) }, ...afterCursor(cursor, 'requesterId') },
         orderBy: [{ createdAt: 'desc' }, { requesterId: 'desc' }],
         take: limit + 1,
         select: { createdAt: true, requesterId: true, requester: { select: CARD_SELECT } },
@@ -123,6 +138,7 @@ const listRequests = async (viewerId, { cursor, limit }) => {
 };
 
 module.exports = {
+    removeFollow,
     acceptAllRequests,
     follow,
     unfollow,

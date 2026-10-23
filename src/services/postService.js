@@ -7,7 +7,8 @@ const AppError = require('../utils/appError');
 const { toPostImage } = require('../lib/images');
 const { processVideo } = require('../lib/videos');
 const { afterCursor, toPage } = require('../utils/cursor');
-const { CARD_SELECT, findActiveUser, relationsFor, canView, toCard } = require('./socialGraph');
+const notifications = require('./notificationService');
+const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, toCard } = require('./socialGraph');
 
 // ---------- loading & visibility ----------
 
@@ -17,6 +18,7 @@ const POST_INCLUDE = {
         orderBy: { position: 'asc' },
         select: { id: true, type: true, key: true, width: true, height: true, thumbnailKey: true, durationMs: true },
     },
+    hashtags: { select: { hashtag: { select: { name: true } } } },
 };
 
 // Enough to decide whether someone may see or react to a post.
@@ -25,16 +27,18 @@ const ACCESS_SELECT = { id: true, authorId: true, status: true, author: { select
 const postNotFound = () => new AppError('Post not found', 404, undefined, 'POST_NOT_FOUND');
 
 // Who may see a post: its author always (any status). Anyone else only if it is
-// APPROVED, the author is active, and the author's profile is visible to them
-// (public, or they are an approved follower: socialGraph.canView).
+// APPROVED, the author is active, there is no block between them (404, as if it didn't
+// exist) and the author's profile is visible to them (public, or approved follower:
+// socialGraph.canView).
 const findVisiblePost = async (viewerId, postId, query = { select: ACCESS_SELECT }) => {
     const post = await prisma.post.findUnique({ where: { id: postId }, ...query });
     if (!post) throw postNotFound();
     if (post.authorId === viewerId) return post;
     if (post.status !== 'APPROVED' || post.author.status !== 'ACTIVE') throw postNotFound();
 
-    const rel = await relationsFor(viewerId, [post.authorId]);
-    if (!canView(viewerId, post.author, rel(post.authorId).followStatus)) {
+    const relation = (await relationsFor(viewerId, [post.authorId]))(post.authorId);
+    if (relation.blockedByMe || relation.blocksMe) throw postNotFound();
+    if (!canView(viewerId, post.author, relation)) {
         throw new AppError('This account is private', 403, undefined, 'PRIVATE_ACCOUNT');
     }
     return post;
@@ -42,7 +46,7 @@ const findVisiblePost = async (viewerId, postId, query = { select: ACCESS_SELECT
 
 // The same rule as a Prisma `where`, for lists of posts.
 const visibleTo = (viewerId) => ({
-    author: { status: 'ACTIVE' },
+    author: { status: 'ACTIVE', ...notBlockedWith(viewerId) },
     OR: [
         { authorId: viewerId },
         {
@@ -94,6 +98,7 @@ const toPosts = async (viewerId, posts) => {
             category: p.category,
             beneficiaries: p.beneficiaries,
             hours: p.hours,
+            hashtags: p.hashtags.map((h) => h.hashtag.name),
             status: p.status,
             ...(isMine && p.rejectionReason && { rejectionReason: p.rejectionReason }),
             likesCount: p.likesCount,
@@ -123,6 +128,40 @@ const pageOfPosts = async (viewerId, where, { cursor, limit }) => {
 
 const removeFiles = (keys) =>
     Promise.all(keys.map((key) => storage.remove(key).catch((err) => console.error('[storage] could not delete', key, err.message))));
+
+// ---------- hashtags ----------
+
+// "#" + up to 50 letters (any script), combining marks, digits or "_", lower-cased, at
+// most 30 per post. \p{M} matters: Hindi and other Indic scripts write vowel signs and
+// the virama as combining marks, so without it "#स्वच्छता" would be cut to "#स".
+const HASHTAG = /#([\p{L}\p{M}\p{N}_]{1,50})/gu;
+const MAX_HASHTAGS = 30;
+
+const extractHashtags = (...texts) => {
+    const tags = new Set();
+    for (const text of texts) for (const [, tag] of (text ?? '').matchAll(HASHTAG)) tags.add(tag.toLowerCase());
+    return [...tags].slice(0, MAX_HASHTAGS);
+};
+
+const recountHashtags = (tx, hashtagIds) =>
+    hashtagIds.length
+        ? tx.$executeRaw`
+              UPDATE hashtags h SET posts_count = (SELECT count(*) FROM post_hashtags ph WHERE ph.hashtag_id = h.id)
+              WHERE h.id = ANY(${hashtagIds}::uuid[])`
+        : null;
+
+// Makes the post's hashtags exactly `names`, inside the caller's transaction.
+const setPostHashtags = async (tx, postId, names) => {
+    const before = await tx.postHashtag.findMany({ where: { postId }, select: { hashtagId: true } });
+    await tx.postHashtag.deleteMany({ where: { postId } });
+    let after = [];
+    if (names.length) {
+        await tx.hashtag.createMany({ data: names.map((name) => ({ name })), skipDuplicates: true });
+        after = await tx.hashtag.findMany({ where: { name: { in: names } }, select: { id: true } });
+        await tx.postHashtag.createMany({ data: after.map((h) => ({ postId, hashtagId: h.id })) });
+    }
+    await recountHashtags(tx, [...new Set([...before, ...after].map((h) => h.hashtagId ?? h.id))]);
+};
 
 // ---------- create / edit / delete ----------
 
@@ -187,15 +226,19 @@ const createPost = async (authorId, data, files = []) => {
             rows.push(row);
         }
 
-        const post = await prisma.post.create({
-            data: {
-                authorId,
-                ...data,
-                status: env.POST_AUTO_APPROVE ? 'APPROVED' : 'UNDER_REVIEW',
-                isReel: rows.length === 1 && rows[0].type === 'VIDEO',
-                media: { create: rows },
-            },
-            include: POST_INCLUDE,
+        const post = await prisma.$transaction(async (tx) => {
+            const created = await tx.post.create({
+                data: {
+                    authorId,
+                    ...data,
+                    status: env.POST_AUTO_APPROVE ? 'APPROVED' : 'UNDER_REVIEW',
+                    isReel: rows.length === 1 && rows[0].type === 'VIDEO',
+                    media: { create: rows },
+                },
+                select: { id: true },
+            });
+            await setPostHashtags(tx, created.id, extractHashtags(data.title, data.description));
+            return tx.post.findUnique({ where: { id: created.id }, include: POST_INCLUDE });
         });
         return (await toPosts(authorId, [post]))[0];
     } catch (err) {
@@ -205,7 +248,8 @@ const createPost = async (authorId, data, files = []) => {
 };
 
 // Text fields only (photos can't be swapped yet). Once moderation is on, an edited
-// post goes back to review so approved content can't be changed afterwards.
+// post goes back to review so approved content can't be changed afterwards. A rejected
+// post always goes back to review when edited: fixing it is how the author appeals.
 const updatePost = async (viewerId, postId, data) => {
     const post = await findOwnPost(viewerId, postId);
     const description = data.description !== undefined ? data.description : post.description;
@@ -218,22 +262,36 @@ const updatePost = async (viewerId, postId, data) => {
         );
     }
 
-    const updated = await prisma.post.update({
-        where: { id: postId },
-        data: {
-            ...data,
-            editedAt: new Date(),
-            ...(!env.POST_AUTO_APPROVE && { status: 'UNDER_REVIEW', rejectionReason: null }),
-        },
-        include: POST_INCLUDE,
+    const updated = await prisma.$transaction(async (tx) => {
+        await tx.post.update({
+            where: { id: postId },
+            data: {
+                ...data,
+                editedAt: new Date(),
+                ...((!env.POST_AUTO_APPROVE || post.status === 'REJECTED') && { status: 'UNDER_REVIEW', rejectionReason: null }),
+            },
+            select: { id: true },
+        });
+        if (data.title !== undefined || data.description !== undefined) {
+            await setPostHashtags(tx, postId, extractHashtags(data.title ?? post.title, description));
+        }
+        return tx.post.findUnique({ where: { id: postId }, include: POST_INCLUDE });
     });
     return (await toPosts(viewerId, [updated]))[0];
 };
 
-// Likes, saves, comments and media rows go with it (ON DELETE CASCADE); files after.
+// Likes, saves, comments, hashtag links and media rows go with it (ON DELETE CASCADE);
+// files after.
 const deletePost = async (viewerId, postId) => {
     const post = await findOwnPost(viewerId, postId);
-    await prisma.post.delete({ where: { id: postId } });
+    const changed = await prisma.$transaction(async (tx) => {
+        const recipients = await notifications.recipientsOf(tx, { postId }); // their rows go by cascade
+        const tags = await tx.postHashtag.findMany({ where: { postId }, select: { hashtagId: true } });
+        await tx.post.delete({ where: { id: postId } });
+        await recountHashtags(tx, tags.map((t) => t.hashtagId));
+        return recipients;
+    });
+    notifications.syncCount(changed);
     await removeFiles(mediaKeys(post.media));
 };
 
@@ -244,13 +302,21 @@ const getPost = async (viewerId, postId) => {
 
 // ---------- feeds (newest first, cursor-paginated) ----------
 
-// Home: your own posts plus approved posts from people you follow.
+// Authors the viewer muted: their posts leave the feeds, but stay reachable on their
+// profile, by link and in search (Instagram's behaviour).
+const notMutedBy = (viewerId) => ({ mutesReceived: { none: { muterId: viewerId } } });
+
+// Home: your own posts plus approved posts from people you follow (and haven't muted).
+// Blocking removes follows both ways, so blocked people can't appear here.
 const homeFeed = (viewerId, query) =>
     pageOfPosts(
         viewerId,
         {
             author: { status: 'ACTIVE' },
-            OR: [{ authorId: viewerId }, { status: 'APPROVED', author: { followers: { some: { followerId: viewerId } } } }],
+            OR: [
+                { authorId: viewerId },
+                { status: 'APPROVED', author: { followers: { some: { followerId: viewerId } }, ...notMutedBy(viewerId) } },
+            ],
         },
         query,
     );
@@ -261,7 +327,7 @@ const exploreFeed = (viewerId, { categories, city, ...query }) =>
         viewerId,
         {
             status: 'APPROVED',
-            author: { status: 'ACTIVE', isPrivate: false },
+            author: { status: 'ACTIVE', isPrivate: false, ...notBlockedWith(viewerId), ...notMutedBy(viewerId) },
             ...(categories?.length && { category: { in: categories } }),
             ...(city && { location: { contains: city, mode: 'insensitive' } }),
         },
@@ -270,12 +336,42 @@ const exploreFeed = (viewerId, { categories, city, ...query }) =>
 
 // A profile's grid. The owner also sees posts under review or rejected.
 const userPosts = async (viewerId, idOrUsername, query) => {
-    const user = await findActiveUser(idOrUsername);
+    const user = await findActiveUser(idOrUsername, { viewerId });
     const rel = await relationsFor(viewerId, [user.id]);
-    if (!canView(viewerId, user, rel(user.id).followStatus)) {
+    if (!canView(viewerId, user, rel(user.id))) {
         throw new AppError('This account is private', 403, undefined, 'PRIVATE_ACCOUNT');
     }
     return pageOfPosts(viewerId, { authorId: user.id, ...(user.id !== viewerId && { status: 'APPROVED' }) }, query);
+};
+
+// Posts with #tag that the viewer may see, newest first.
+const hashtagFeed = (viewerId, tag, query) =>
+    pageOfPosts(viewerId, { hashtags: { some: { hashtag: { name: tag } } }, ...visibleTo(viewerId) }, query);
+
+// Search: visible posts whose title, description, location, category, hashtags or
+// author's name contain `q` (case-insensitive; trigram indexes keep it fast). Newest
+// first, so it pages with the same cursor as the feeds.
+const searchPosts = (viewerId, q, query) => {
+    const like = { contains: q, mode: 'insensitive' };
+    return pageOfPosts(
+        viewerId,
+        {
+            AND: [
+                visibleTo(viewerId),
+                {
+                    OR: [
+                        { title: like },
+                        { description: like },
+                        { location: like },
+                        { category: like },
+                        { author: { name: like } },
+                        { hashtags: { some: { hashtag: { name: { contains: q.toLowerCase() } } } } },
+                    ],
+                },
+            ],
+        },
+        query,
+    );
 };
 
 // Newest save first. Posts you can no longer see (deleted, author went private) drop out.
@@ -293,7 +389,8 @@ const savedPosts = async (viewerId, { cursor, limit }) => {
 // Reels: single-video posts you can see (public accounts, people you follow, your
 // own), newest first. Ranking by watch time/trending can replace the ordering later
 // without changing the response.
-const reelsFeed = (viewerId, query) => pageOfPosts(viewerId, { isReel: true, ...visibleTo(viewerId) }, query);
+const reelsFeed = (viewerId, query) =>
+    pageOfPosts(viewerId, { AND: [{ isReel: true, author: notMutedBy(viewerId) }, visibleTo(viewerId)] }, query);
 
 // The app calls this when a video has played (and again with the watch time when the
 // viewer moves on). First play per viewer = +1 view; later plays only add up plays
@@ -323,31 +420,34 @@ const recordView = async (viewerId, postId, { watchMs }) => {
 // ---------- likes, saves, shares ----------
 
 // createMany/deleteMany report whether a row really changed, so double taps and
-// races can't move the counter twice (same pattern as follows).
-const react = (model, counter) => ({
+// races can't move the counter twice (same pattern as follows). `onAdd`/`onRemove`
+// run in the same transaction when a row really changed (likes notify the author).
+const react = (model, counter, { onAdd, onRemove } = {}) => ({
     add: async (viewerId, postId) => {
-        await findVisiblePost(viewerId, postId);
-        return prisma.$transaction(async (tx) => {
+        const post = await findVisiblePost(viewerId, postId);
+        const [value, notificationId] = await prisma.$transaction(async (tx) => {
             const { count } = await tx[model].createMany({ data: [{ userId: viewerId, postId }], skipDuplicates: true });
-            const post = count
-                ? await tx.post.update({ where: { id: postId }, data: { [counter]: { increment: 1 } }, select: { [counter]: true } })
-                : await tx.post.findUnique({ where: { id: postId }, select: { [counter]: true } });
-            return post[counter];
+            if (!count) return [(await tx.post.findUnique({ where: { id: postId }, select: { [counter]: true } }))[counter]];
+            const row = await tx.post.update({ where: { id: postId }, data: { [counter]: { increment: 1 } }, select: { [counter]: true } });
+            return [row[counter], await onAdd?.(tx, viewerId, post)];
         });
+        notifications.deliver(notificationId);
+        return value;
     },
     remove: async (viewerId, postId) => {
-        await findVisiblePost(viewerId, postId);
-        return prisma.$transaction(async (tx) => {
+        const post = await findVisiblePost(viewerId, postId);
+        const [value, changed] = await prisma.$transaction(async (tx) => {
             const { count } = await tx[model].deleteMany({ where: { userId: viewerId, postId } });
-            const post = count
-                ? await tx.post.update({ where: { id: postId }, data: { [counter]: { decrement: 1 } }, select: { [counter]: true } })
-                : await tx.post.findUnique({ where: { id: postId }, select: { [counter]: true } });
-            return post[counter];
+            if (!count) return [(await tx.post.findUnique({ where: { id: postId }, select: { [counter]: true } }))[counter]];
+            const row = await tx.post.update({ where: { id: postId }, data: { [counter]: { decrement: 1 } }, select: { [counter]: true } });
+            return [row[counter], await onRemove?.(tx, viewerId, post)];
         });
+        notifications.syncCount(changed);
+        return value;
     },
 });
 
-const likes = react('postLike', 'likesCount');
+const likes = react('postLike', 'likesCount', { onAdd: notifications.postLiked, onRemove: notifications.postUnliked });
 const saves = react('postSave', 'savesCount');
 
 const likePost = async (viewerId, postId) => ({ liked: true, likesCount: await likes.add(viewerId, postId) });
@@ -370,7 +470,7 @@ const sharePost = async (viewerId, postId) => {
 const listLikes = async (viewerId, postId, { cursor, limit }) => {
     await findVisiblePost(viewerId, postId);
     const rows = await prisma.postLike.findMany({
-        where: { postId, user: { status: 'ACTIVE' }, ...afterCursor(cursor, 'userId') },
+        where: { postId, user: { status: 'ACTIVE', ...notBlockedWith(viewerId) }, ...afterCursor(cursor, 'userId') },
         orderBy: [{ createdAt: 'desc' }, { userId: 'desc' }],
         take: limit + 1,
         select: { createdAt: true, userId: true, user: { select: CARD_SELECT } },
@@ -381,7 +481,12 @@ const listLikes = async (viewerId, postId, { cursor, limit }) => {
 };
 
 module.exports = {
+    POST_INCLUDE,
+    toPosts,
     findVisiblePost,
+    extractHashtags,
+    hashtagFeed,
+    searchPosts,
     createPost,
     updatePost,
     deletePost,

@@ -35,6 +35,8 @@ Phone: `npm run adb:reverse` from the app folder so `localhost:3000` reaches thi
 | `npm test` | Migrate the test DB, then run the integration tests (`test/`) |
 | `npm run auth:cleanup` | Purge expired tokens/codes and accounts past their deletion date |
 | `npm run db:clean-postman` | List the test users Postman runs create (`pm_…`/`ph_…`/`em_…` @example.com); add `-- --yes` to delete them. Refuses in production |
+| `npm run ws:listen -- <user> <password>` | Log in and print live WebSocket events (see "Notifications") |
+| `npm run user:role -- <username or email> ADMIN` | Give an account a staff role (`ADMIN`, `REVIEWER` or `USER`). How the first admin is made |
 
 ### Testing the API in Postman (no email/SMS needed)
 
@@ -45,12 +47,17 @@ Keep it updated with every new endpoint (new features get new numbered folders).
    refuses to start with it in production.
 2. `npm run dev`
 3. From this folder, run `postman collection run postman/MyVolApp-API.postman_collection.json`, or
-   import it into the Postman app and use the Collection Runner (~85 s, 191 requests).
+   import it into the Postman app and use the Collection Runner (~95 s, 280 requests).
 
 Folders 0–10 cover auth: verify email, refresh + reuse detection, sessions, change/forgot/reset password,
 change email, logout, deactivate/delete, lockout, Google, then phone signup/login/multi-account/reset/
 add-phone (waits 61 s once for the code cooldown). Folders 11–16 cover profiles and follow, 17–21 posts,
-feeds, likes, saves, shares and comments, 22 videos and reels (uploads read `postman/fixtures/`).
+feeds, likes, saves, shares and comments, 22 videos and reels (uploads read `postman/fixtures/`),
+23 notifications and settings (the runner can't open WebSockets: watch live events with `npm run ws:listen`),
+24 block and mute, 25 search and hashtags, 26 reports and moderation. Folder 26's staff requests log in
+with the collection variables `adminLogin` / `adminPassword` (locally: `dev_admin`, made with
+`npm run user:role -- dev_admin ADMIN`); without them those requests are skipped. They make B a reviewer
+and then a user again.
 The collection is git-ignored (local only), like every `.env*` file.
 Tokens and codes are saved into collection variables, so single requests also work by hand.
 Google sign-in runs only when the `googleIdToken` variable is set (see that folder's description).
@@ -82,6 +89,10 @@ src/lib/images.js       avatar + post photo processing (sharp)
 src/lib/videos.js       video probe/transcode/cover (bundled ffmpeg), one at a time
 src/services/postService.js     posts, feeds, likes/saves/shares, the post visibility rule
 src/services/commentService.js  comments, replies, comment likes
+src/services/notificationService.js  Activity list, recording events, live delivery + banner rules
+src/services/settingsService.js app settings (JSONB, defaults merged at read time)
+src/lib/realtime.js     our WebSocket server (/api/v1/ws): login, devices per user, heartbeat
+scripts/ws-listen.js    prints live events for a user (npm run ws:listen)
 uploads/                avatars and post photos in development (git-ignored)
 src/generated/prisma    generated client (git-ignored)
 ```
@@ -180,18 +191,21 @@ Base `/api/v1/users`. **Every route needs `Authorization: Bearer`.** `:user` is 
 | POST | `/:user/follow` | – | → `{ followStatus: 'following' \| 'requested' }` (private = request) |
 | DELETE | `/:user/follow` | – | Unfollow or cancel a request → `{ followStatus: 'none' }` |
 | DELETE | `/:user/follower` | – | Remove that person from my followers |
+| POST / DELETE | `/:user/block` | – | → `{ blocked }`. See "Block & mute" |
+| POST / DELETE | `/:user/mute` | – | → `{ muted }` |
+| GET | `/me/blocked`, `/me/muted` | `?cursor&limit` | Settings lists, newest first (rows add `blockedAt` / `mutedAt`) |
 
 Profile shape: `{ id, username, name, bio, avatarUrl, isPrivate, followersCount, followingCount, createdAt,
-isMe, followStatus, followsYou, canViewContent, details }`. `details` has location, skills, preferred
+isMe, followStatus, followsYou, canViewContent, details, blockedByMe, mutedByMe }`. `details` has location, skills, preferred
 areas, availability and volunteering types; gender, dateOfBirth, qualification and fieldOfStudy are added
 only for the owner or when `showPersonalDetails` is on.
 
 List rows: `{ id, username, name, avatarUrl, isPrivate, isMe, followStatus, followsYou }`.
 Lists return `{ users, nextCursor }`; pass `nextCursor` back as `?cursor=` until it is `null`.
 
-Privacy rule (`socialGraph.canView`): you see details, lists (and later posts) if the account is yours,
-public, or you are an approved follower. Deactivated/suspended/pending-deletion users are 404 and are left
-out of lists.
+Privacy rule (`socialGraph.canView`): you see details, lists and posts if the account is yours, or there
+is no block between you and it is public or you follow it. Deactivated/suspended/pending-deletion users,
+and anyone who blocked you, are 404 and are left out of lists.
 
 Testing in Postman: folders 11–16 of `postman/MyVolApp-API.postman_collection.json` (see above).
 
@@ -199,7 +213,8 @@ Testing in Postman: folders 11–16 of `postman/MyVolApp-API.postman_collection.
 |---|---|---|
 | 404 | `USER_NOT_FOUND` | no such active user |
 | 403 | `PRIVATE_ACCOUNT` | private and you don't follow them: show the lock screen |
-| 400 | `CANNOT_FOLLOW_SELF`, `USERNAME_UNCHANGED`, `INVALID_CURSOR` | |
+| 400 | `CANNOT_FOLLOW_SELF`, `CANNOT_TARGET_SELF`, `USERNAME_UNCHANGED`, `INVALID_CURSOR` | |
+| 403 | `USER_BLOCKED` | you blocked them: unblock before following |
 | 409 | `USERNAME_TAKEN` | |
 | 429 | `USERNAME_CHANGE_TOO_SOON` | `details[0].message` has the date |
 | 404 | `REQUEST_NOT_FOUND` | request already handled |
@@ -232,7 +247,8 @@ verified email or phone (403 `EMAIL_NOT_VERIFIED`); liking, saving and sharing d
 
 Post shape: `{ id, author (user card), media: [{ id, type: 'image', url, width, height }], title,
 description, location, category, beneficiaries, hours, status, likesCount, commentsCount, savesCount,
-sharesCount, likedByMe, savedByMe, isMine, createdAt, editedAt }`. `status` is `APPROVED`,
+sharesCount, likedByMe, savedByMe, isMine, hashtags, createdAt, editedAt }`. `hashtags` are the `#tags`
+found in the title and description (lower-case, without `#`). `status` is `APPROVED`,
 `UNDER_REVIEW` or `REJECTED` (the app shows "Approved", "Under Review", "Rejected").
 Categories: Health, Animal Welfare, Hunger & Poverty, Drug Prevention, Education, Gender Equality,
 Youth & Sports, Child Rights, Environment.
@@ -240,8 +256,10 @@ Youth & Sports, Child Rights, Environment.
 Comment shape: `{ id, postId, parentId, text, author, likesCount, likedByMe, repliesCount, createdAt, canDelete }`.
 
 Who sees a post (`postService.findVisiblePost` / `visibleTo`): its author always; others only when it is
-APPROVED, the author is active, and the author's profile is visible to them (public, or approved follower).
-`POST_AUTO_APPROVE=true` (default until moderation ships) approves posts on creation.
+APPROVED, the author is active, there is no block between them, and the author's profile is visible to
+them (public, or approved follower). `POST_AUTO_APPROVE=true` (the default) approves posts on creation;
+set it to `false` once reviewers work the queue (see "Reports & moderation"). Editing a rejected post
+always sends it back to review.
 
 | HTTP | `code` | Meaning |
 |---|---|---|
@@ -281,6 +299,158 @@ rohan_gupta, ananya_singh; password `Volunteer2026`) with avatars, follows, 5 re
 photo+video carousel, likes, comments and views. Options: `-- --reset` (recreate), `-- --follow <your
 username>` (so they appear in your home feed), `-- --videos <folder>` (use your own clips for the reels
 instead of generated test patterns).
+
+## Notifications (live over our own WebSocket)
+
+No Firebase, no Expo push service, no third party: notifications reach the app over a WebSocket on this
+server (`src/lib/realtime.js`, built on the `ws` protocol library). The app shows them as phone
+notifications itself (local notifications).
+
+**What this means:** a notification arrives instantly while the app is open, or for a short while after
+it goes to the background. When the app is closed (or Android has suspended it), nothing arrives; when it
+opens again it reconnects, gets the unread count in `ready`, and reloads the list. Waking a closed app is
+only possible through Google's FCM (Android) or Apple's APNs (iOS); that would be a later, optional step.
+
+### REST
+
+Base `/api/v1`. **Every route needs `Authorization: Bearer`.**
+
+| Method | Path | Body / query | Notes |
+|---|---|---|---|
+| GET | `/notifications` | `?cursor&limit` | The Activity tab, newest first → `{ notifications, nextCursor, unreadCount }` |
+| GET | `/notifications/unread-count` | – | → `{ unreadCount }` for the bell/tab badge |
+| POST | `/notifications/:id/read` | – | → `{ unreadCount }` |
+| POST | `/notifications/read-all` | `{ before? }` (ISO time, optional) | Only up to `before` if given, so one arriving meanwhile stays unread |
+| DELETE | `/notifications/:id` | – | → `{ unreadCount }` |
+| POST | `/notifications/test` | – | Sends a `test` event to your connected devices → `{ devices }` |
+| GET | `/settings` | – | → `{ settings }`: the app's notification settings, defaults filled in |
+| PATCH | `/settings` | any of the keys below | Merged into what is stored; unknown keys/values → 400 |
+
+Notification shape: `{ id, type, message, actor (user card or null), post: { id, title, thumbnailUrl } | null,
+comment: { id, text } | null, url, read, createdAt }`. `message` is ready to show ("Priya Sharma liked your
+activity "Beach cleanup"."). `url` is the app deep link (`myvolapp://post/<id>` or `myvolapp://user/<id>`).
+
+| `type` | When | Banner setting |
+|---|---|---|
+| `follow` | someone follows you (or you accepted their request) | `notifNewFollowers` |
+| `follow_request` | someone asks to follow your private account (gone once accepted/declined/cancelled) | `notifFollowRequests` |
+| `follow_accepted` | your request was accepted | `notifFollowRequests` |
+| `like` / `comment_like` | your post / your comment was liked | `notifLikes` |
+| `comment` | someone commented on your post | `notifComments` |
+| `reply` | someone replied to your comment | `notifComments` |
+| `approved` / `rejected` | a reviewer approved/rejected your post (only when its status really changes) | `notifActivityApproved` |
+
+Undoing an action deletes its notification (unlike, unfollow, cancelled request, deleted comment or post).
+Repeating an action never makes a second one. You're never notified about your own actions.
+
+**Settings only decide whether the app shows a phone banner** (the `alert` field below). The Activity list
+always shows everything (like Instagram). Keys (same as the app's `settingsSlice`): `pauseAll`,
+`notifLikes` / `notifComments` / `notifMentions` (`'off' | 'following' | 'everyone'`), `notifNewFollowers`,
+`notifFollowRequests`, `notifActivityApproved`, `notifActivityReminders`, `notifNearbyOpportunities`,
+`notifAnnouncements`, `emailWeeklyDigest`, `emailOpportunities`, `emailProductUpdates`, `notifSound`,
+`notifVibrate`, `quietHours` (22:00–07:00 in `DEFAULT_TIMEZONE`: banner on the `silent` channel). Mentions,
+reminders, nearby, announcements and the email keys are stored for later features.
+
+### The WebSocket: `ws://localhost:3000/api/v1/ws`
+
+Same port as the API, so `adb reverse tcp:3000 tcp:3000` (the app's `npm run android`) covers it over USB.
+JSON text messages:
+
+| Direction | Message | Meaning |
+|---|---|---|
+| app → server | `{ "type": "auth", "token": "<accessToken>" }` | First message, within 10 s (or send `Authorization: Bearer` on connect) |
+| server → app | `{ "type": "ready", "userId", "unreadCount" }` | Logged in; set the badge |
+| server → app | `{ "type": "notification", "notification": {…same shape as the list…}, "unreadCount", "alert" }` | New notification. Prepend it to the list, set the badge. If `alert` is not null, show a phone notification with `alert.channelId` (`default` / `sound-only` / `vibrate-only` / `silent`) |
+| server → app | `{ "type": "unread_count", "unreadCount" }` | The badge changed (unlike, read on another device, deleted comment...) |
+| server → app | `{ "type": "test", "message", "alert" }` | From `POST /notifications/test` |
+| app → server | `{ "type": "ping" }` → `{ "type": "pong" }` | Optional; the server also pings every 30 s |
+| server → app | `{ "type": "error", "code", "message" }` | Bad message; the connection stays open |
+
+Close codes: **4401** with reason `TOKEN_EXPIRED` → refresh the token and reconnect; `SESSION_INVALID` /
+`ACCOUNT_INACTIVE` / `TOKEN_INVALID` → log out. **4408** no auth in time, **4429** too many connections
+(max = `MAX_SESSIONS_PER_USER`), **1001** server restarting → reconnect with backoff (1 s, 2 s, 4 s… max 30 s).
+A logged-out or revoked session is disconnected within 30 s.
+
+### What the app does
+
+1. Connect after login, and again whenever the app comes to the foreground (`AppState` `active`); close it on
+   logout. On `ready` set the badge; refetch `GET /notifications` when the Activity tab opens.
+2. On `notification`: update the list and badge; if `alert` is set, show it with
+   `Notifications.scheduleNotificationAsync({ content: { title: 'MyVolApp', body: message, data: { url } }, trigger: null })`
+   (`expo-notifications`, local only: needs no Firebase, no EAS project, no push token). On Android create
+   the four channels once at startup with `setNotificationChannelAsync`.
+3. On a banner tap, open `data.url` (the app's linking config already handles `myvolapp://post/…` and `myvolapp://user/…`).
+
+### Try it without the app
+
+`npm run ws:listen -- priya_sharma Volunteer2026` logs in like the app and prints every event. Then, from
+Postman or another terminal, like or comment on one of Priya's posts as another demo user: the event shows
+up at once, with the badge count and whether a banner would show.
+
+## Block & mute
+
+Like Instagram, and neither person is told. Routes are under `/api/v1/users` (table above).
+
+- **Block** works both ways once either side blocks. The person who blocked you is a 404 to you
+  (profile, posts, comments, search, lists). Someone you blocked still opens as a profile with
+  `blockedByMe: true` and no content, so the app can show "Unblock". Blocking removes follows and follow
+  requests in both directions and the notifications between you, and stops new ones. Old likes and comments
+  stay, hidden from each other. Unblocking doesn't restore follows.
+- **Mute** removes their posts from your home feed, explore and reels. Their profile, links and search
+  still show them, and follows are unchanged.
+
+## Search & hashtags
+
+Base `/api/v1`. **Every route needs `Authorization: Bearer`.** Limit: 90 searches a minute per user.
+
+| Method | Path | Query | Notes |
+|---|---|---|---|
+| GET | `/search/users` | `q` (1–100, a leading `@` is ignored), `cursor`, `limit` | "Volunteers" tab: username, name or city. Ranked exact → prefix → close match (typos) → followers. Rows add `city` |
+| GET | `/search/posts` | `q` (a leading `#` is ignored), `cursor`, `limit` | "Activities" tab: title, description, location, category, author name or hashtag. Newest first; only posts you may see |
+| GET | `/search/hashtags` | `q` (a leading `#` is ignored), `cursor`, `limit` | → `{ hashtags: [{ name, postsCount }] }`: exact, then prefix (most used first), then close matches |
+| GET | `/hashtags/:tag/posts` | `cursor`, `limit` | A tag's page → `{ hashtag: { name, postsCount }, posts, nextCursor }`. 404 `HASHTAG_NOT_FOUND` |
+
+Matching uses Postgres `pg_trgm` (the migration creates it; no superuser needed). People and hashtag
+results page with an opaque cursor that stops after 500 results. Hashtags work in any script (`#स्वच्छता`).
+
+## Reports & moderation
+
+**Users** (base `/api/v1/reports`, 30 reports an hour per user). Reports are anonymous to the person
+reported.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/reports` | `type` (`post` \| `comment` \| `user`), `targetId` (an id, or a username for users), `reason`, `details?` (≤500) | 201, or 200 with `alreadyReported: true` if your report on it is still open. Only what you can see; never yourself |
+| POST | `/reports/problem` | `category` (`bug` \| `content` \| `account` \| `idea`), `details` (15–1000), `deviceInfo?` | The app's "Report a problem" screen |
+
+Reasons: `spam, nudity, hate_speech, harassment, violence, self_harm, false_information, scam,
+intellectual_property, fake_account, other`. A post reported by `REPORT_AUTO_HIDE_THRESHOLD` (5)
+different people is hidden (back to Under Review) until a reviewer decides; `0` turns that off.
+
+**Staff** (base `/api/v1/admin`, role `REVIEWER` or `ADMIN`; others get 403 `FORBIDDEN`). Make the first
+admin with `npm run user:role -- <username> ADMIN`; after that admins use the role endpoint.
+
+| Method | Path | Body / query | Who | Notes |
+|---|---|---|---|---|
+| GET | `/admin/posts` | `?status=under_review\|rejected\|approved` (default under_review), `cursor`, `limit` | staff | Oldest first, any privacy; each post has `openReports: { count, reasons }` |
+| POST | `/admin/posts/:postId/approve` | `note?` | staff | Dismisses its open reports; notifies the author if the status changed |
+| POST | `/admin/posts/:postId/reject` | `reason` (3–300) | staff | Resolves its open reports; the author sees `rejectionReason` |
+| DELETE | `/admin/comments/:commentId` | `reason` | staff | Deletes it and its replies; the text is kept in the audit log |
+| GET | `/admin/reports` | `?status=open\|resolved\|dismissed` (default open), `type?`, `cursor`, `limit` | staff | Oldest first, with reporter, target and `openReportsOnTarget` |
+| POST | `/admin/reports/:reportId/resolve` | `action` (`dismiss` \| `resolve` \| `remove` \| `suspend`), `note?` | staff (`suspend`: admin) | Closes every open report on the same target |
+| POST | `/admin/users/:userId/suspend` | `reason` | admin | Logs them out everywhere and closes their WebSockets now |
+| POST | `/admin/users/:userId/unsuspend` | `note?` | admin | |
+| POST | `/admin/users/:userId/role` | `role` (`user` \| `reviewer` \| `admin`) | admin | Not your own |
+| GET | `/admin/actions` | `?targetId&cursor&limit` | admin | Audit log, newest first (`moderator: null` = automatic or command line) |
+
+| HTTP | `code` | Meaning |
+|---|---|---|
+| 400 | `CANNOT_REPORT_SELF`, `CANNOT_TARGET_SELF` | your own content/account |
+| 400 | `NOTHING_TO_REMOVE`, `NOTHING_TO_SUSPEND` | that action doesn't fit this report |
+| 403 | `FORBIDDEN` | not staff, or a reviewer doing an admin action |
+| 403 | `TARGET_IS_ADMIN` | remove the admin role before suspending |
+| 409 | `REPORT_CLOSED`, `NOT_SUSPENDED`, `ACCOUNT_DELETING` | |
+| 404 | `REPORT_NOT_FOUND`, `POST_NOT_FOUND`, `COMMENT_NOT_FOUND`, `USER_NOT_FOUND` | |
 
 ## Prisma 7 notes
 

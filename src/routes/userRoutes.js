@@ -25,6 +25,8 @@ router.delete('/me/avatar', users.removeAvatar);
 router.get('/me/follow-requests', list, users.listRequests);
 router.post('/me/follow-requests/:userId/accept', validate({ params: schemas.requestParams }), users.acceptRequest);
 router.delete('/me/follow-requests/:userId', validate({ params: schemas.requestParams }), users.declineRequest);
+router.get('/me/blocked', list, users.listBlocked);
+router.get('/me/muted', list, users.listMuted);
 
 // ---------- other users: :user is an id or a username ----------
 router.get('/:user', user, users.getProfile);
@@ -34,5 +36,9 @@ router.get('/:user/posts', user, list, posts.userPosts);
 router.post('/:user/follow', limits.followLimiter, user, users.follow);
 router.delete('/:user/follow', limits.followLimiter, user, users.unfollow);
 router.delete('/:user/follower', user, users.removeFollower);
+router.post('/:user/block', limits.followLimiter, user, users.block);
+router.delete('/:user/block', limits.followLimiter, user, users.unblock);
+router.post('/:user/mute', limits.followLimiter, user, users.mute);
+router.delete('/:user/mute', limits.followLimiter, user, users.unmute);
 
 module.exports = router;
