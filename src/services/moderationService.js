@@ -5,6 +5,7 @@ const AppError = require('../utils/appError');
 const { afterCursor, toPage } = require('../utils/cursor');
 const sessions = require('./sessionService');
 const notifications = require('./notificationService');
+const impact = require('./impactService');
 const { POST_INCLUDE, toPosts } = require('./postService');
 const { findComment, removeComment: deleteCommentAndReplies } = require('./commentService');
 const { CARD_SELECT, relationsFor, toCard } = require('./socialGraph');
@@ -61,14 +62,16 @@ const listPosts = async (moderatorId, { status, cursor, limit }) => {
     };
 };
 
-// Approve or reject. Only a real change notifies the author ("Your … was approved").
+// Approve or reject. Only a real change notifies the author ("Your … was approved"); an
+// approval that completes a medal tier also sends the medal.
 const reviewPost = async (moderatorId, postId, status, reason) => {
     const post = await prisma.post.findUnique({ where: { id: postId }, select: { id: true, authorId: true, status: true, rejectionReason: true } });
     if (!post) throw notFound('Post');
     const rejectionReason = status === 'REJECTED' ? reason : null;
     const changed = post.status !== status || post.rejectionReason !== rejectionReason;
+    const newlyApproved = status === 'APPROVED' && post.status !== 'APPROVED';
 
-    const notificationId = await prisma.$transaction(async (tx) => {
+    const notificationIds = await prisma.$transaction(async (tx) => {
         await tx.post.update({ where: { id: postId }, data: { status, rejectionReason }, select: { id: true } });
         await log(tx, moderatorId, status === 'APPROVED' ? 'APPROVE_POST' : 'REJECT_POST', 'post', postId, reason);
         // Approving clears the reports (no violation); rejecting resolves them.
@@ -79,9 +82,12 @@ const reviewPost = async (moderatorId, postId, status, reason) => {
             status === 'APPROVED' ? 'DISMISSED' : 'RESOLVED',
             status === 'APPROVED' ? 'post approved' : `post rejected: ${reason}`,
         );
-        return changed ? notifications.postReviewed(tx, { ...post, status }) : null;
+        return [
+            changed ? await notifications.postReviewed(tx, { ...post, status }) : null,
+            newlyApproved ? await impact.checkMedal(tx, post.authorId) : null,
+        ];
     });
-    notifications.deliver(notificationId);
+    notifications.deliver(notificationIds);
     return { post: { id: postId, status, rejectionReason } };
 };
 

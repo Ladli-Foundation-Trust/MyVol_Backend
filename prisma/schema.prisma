@@ -57,6 +57,8 @@ enum NotificationType {
   COMMENT_LIKE
   POST_APPROVED
   POST_REJECTED
+  // Reached a medal tier (impactService.checkMedal). No actor; dedupe key medal:<tier>.
+  MEDAL_EARNED
 }
 
 model User {

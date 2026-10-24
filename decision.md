@@ -504,6 +504,35 @@ in again.
 **Why.** A suspended account must not keep posting with an access token that is still valid for 15 minutes,
 or keep receiving live events.
 
+### D56. Impact is computed from approved posts on read, not stored (2026-10-23)
+**Decision.** `impactService` adds up the author's **APPROVED** posts with one `aggregate` (count, hours,
+beneficiaries, likes) plus a `groupBy` for the per-category breakdown, on every request. There are no
+counter columns. Totals and the medal are public and embedded in every profile (`profile.impact`), the
+same as follower counts. `byCategory` describes the content, so it needs `canView`. The owner also gets
+`underReview` / `rejected`. Nothing is shown across a block.
+**Why.** Approval, rejection, auto-hide, edits that send a post back to review, deletes and account purges
+all change these numbers. A stored counter would need updating in every one of those paths, and a missed
+one drifts silently. The aggregate runs on the `(author_id, created_at)` index and covers at most a few
+hundred rows per volunteer.
+**Trade-off.** One extra aggregate per profile view. If that ever shows up in query stats, cache the totals
+in a row kept up to date by the same paths (the API shape stays the same).
+
+### D57. Medals follow the current count; reaching a tier notifies once
+**Decision.** Tiers live in `src/config/medals.js` (Bronze 3, Silver 6, Gold 12, Platinum 25 approved
+activities, the app's existing ladder) and are sent in the API, so the app can stop hard-coding them.
+`current`, `next` (+ `remaining`) and `tiers[].earned` come from the current approved count, so a deleted
+or rejected post can take a medal away. The approving transaction (create with `POST_AUTO_APPROVE`, or a
+reviewer's approve) calls `checkMedal`. When the new count **equals** a threshold, it records a
+`MEDAL_EARNED` notification with dedupe key `medal:<tier>`. That fires once per tier, even if the user
+drops below and reaches it again. Its banner follows `notifActivityApproved`, and tapping it opens your
+own profile.
+**Why.** "Equals" (not "≥") means existing users aren't flooded with notifications for tiers they passed
+before this shipped. The dedupe key stops repeats without a separate awards table. Taking a medal away
+keeps it honest: a medal always means that many approved activities right now.
+**Trade-off.** No record of *when* a medal was first earned beyond the notification, which ages out after
+90 days (after that, re-reaching a tier could notify again). Add a `user_medals` table if medals become
+permanent awards or certificates (plan: "Later").
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|
@@ -511,7 +540,7 @@ or keep receiving live events.
 | Sign in with Apple | Required by App Store rules if Google sign-in ships on iOS. Android-first for now. |
 | Real SMS delivery | Phone auth is built (D30) but codes go to the console. Needs a provider (MSG91 etc.) and a DLT-registered sender in India. |
 | Suggested volunteers | Rest of Phase 8. Must use `notBlockedWith` (D49). |
-| Impact stats and medal tiers (Bronze 3 / Silver 6 / Gold 12 / Platinum 25) | Rest of Phase 9. Hours and beneficiaries are already stored on posts. |
+| Permanent medal awards / certificates | Medals follow the current count (D57). Needs a `user_medals` table. |
 | Who can comment / who can message you | Privacy settings. Blocks already stop both (D49). |
 | Turning off `POST_AUTO_APPROVE` | Moderation exists now (D54). It stays on until a reviewer is ready to work the queue; with it off, new posts start Under Review. |
 | Web admin panel | Staff use the `/admin` API through Postman for now (plan: "Later"). |

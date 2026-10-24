@@ -357,6 +357,22 @@ POST /reports         reportLimiter → resolveTarget (must be visible to you, n
                       then close every open report on the same target + log
 ```
 
+## 4g. Impact & medals (`/users/me/impact`, `/users/:user/impact`, `profile.impact`)
+
+```
+impactService (posts WHERE author_id = u AND status = 'APPROVED'; config/medals.js = the tiers)
+  totals          aggregate: count, sum(hours), sum(beneficiaries), sum(likes_count)
+  byCategory      groupBy(category)                   only if canView (null otherwise)
+  medalsFor(n)    current = highest tier ≤ n, next = first tier > n (+ remaining), tiers[].earned
+  summaryFor      { activities, hours, beneficiaries, medal } → every profile (null across a block)
+
+approval paths, inside their own transaction:
+  postService.createPost   (POST_AUTO_APPROVE)            → impact.checkMedal(tx, author)
+  moderationService.reviewPost   (status → APPROVED)       → impact.checkMedal(tx, author)
+    checkMedal: count == a tier's threshold → notifications.medalEarned (dedupe medal:<tier>)
+  → deliver() after commit (banner setting notifActivityApproved; url myvolapp://user/<me>)
+```
+
 ## 5. Background job
 
 ```

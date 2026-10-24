@@ -27,12 +27,14 @@ router.post('/me/follow-requests/:userId/accept', validate({ params: schemas.req
 router.delete('/me/follow-requests/:userId', validate({ params: schemas.requestParams }), users.declineRequest);
 router.get('/me/blocked', list, users.listBlocked);
 router.get('/me/muted', list, users.listMuted);
+router.get('/me/impact', users.myImpact);
 
 // ---------- other users: :user is an id or a username ----------
 router.get('/:user', user, users.getProfile);
 router.get('/:user/followers', user, list, users.followers);
 router.get('/:user/following', user, list, users.following);
 router.get('/:user/posts', user, list, posts.userPosts);
+router.get('/:user/impact', user, users.impact);
 router.post('/:user/follow', limits.followLimiter, user, users.follow);
 router.delete('/:user/follow', limits.followLimiter, user, users.unfollow);
 router.delete('/:user/follower', user, users.removeFollower);

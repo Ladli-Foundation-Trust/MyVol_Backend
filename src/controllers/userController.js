@@ -1,6 +1,7 @@
 const profiles = require('../services/profileService');
 const follows = require('../services/followService');
 const blocks = require('../services/blockService');
+const impact = require('../services/impactService');
 
 const ok = (res, data) => res.json({ status: 'success', data });
 
@@ -50,6 +51,11 @@ exports.following = async (req, res) => {
 exports.follow = async (req, res) => ok(res, await follows.follow(req.user.id, req.params.user));
 
 exports.unfollow = async (req, res) => ok(res, await follows.unfollow(req.user.id, req.params.user));
+
+// ---------- impact & medals ----------
+
+exports.myImpact = async (req, res) => ok(res, await impact.getMyImpact(req.user.id));
+exports.impact = async (req, res) => ok(res, await impact.getImpact(req.user.id, req.params.user));
 
 // ---------- block & mute ----------
 

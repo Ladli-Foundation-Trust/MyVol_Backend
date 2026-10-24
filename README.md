@@ -47,14 +47,14 @@ Keep it updated with every new endpoint (new features get new numbered folders).
    refuses to start with it in production.
 2. `npm run dev`
 3. From this folder, run `postman collection run postman/MyVolApp-API.postman_collection.json`, or
-   import it into the Postman app and use the Collection Runner (~95 s, 280 requests).
+   import it into the Postman app and use the Collection Runner (~95 s, 290 requests).
 
 Folders 0–10 cover auth: verify email, refresh + reuse detection, sessions, change/forgot/reset password,
 change email, logout, deactivate/delete, lockout, Google, then phone signup/login/multi-account/reset/
 add-phone (waits 61 s once for the code cooldown). Folders 11–16 cover profiles and follow, 17–21 posts,
 feeds, likes, saves, shares and comments, 22 videos and reels (uploads read `postman/fixtures/`),
 23 notifications and settings (the runner can't open WebSockets: watch live events with `npm run ws:listen`),
-24 block and mute, 25 search and hashtags, 26 reports and moderation. Folder 26's staff requests log in
+24 block and mute, 25 search and hashtags, 26 reports and moderation, 27 impact and medals. Folder 26's staff requests log in
 with the collection variables `adminLogin` / `adminPassword` (locally: `dev_admin`, made with
 `npm run user:role -- dev_admin ADMIN`); without them those requests are skipped. They make B a reviewer
 and then a user again.
@@ -194,9 +194,11 @@ Base `/api/v1/users`. **Every route needs `Authorization: Bearer`.** `:user` is 
 | POST / DELETE | `/:user/block` | – | → `{ blocked }`. See "Block & mute" |
 | POST / DELETE | `/:user/mute` | – | → `{ muted }` |
 | GET | `/me/blocked`, `/me/muted` | `?cursor&limit` | Settings lists, newest first (rows add `blockedAt` / `mutedAt`) |
+| GET | `/me/impact`, `/:user/impact` | – | See "Impact & medals" |
 
 Profile shape: `{ id, username, name, bio, avatarUrl, isPrivate, followersCount, followingCount, createdAt,
-isMe, followStatus, followsYou, canViewContent, details, blockedByMe, mutedByMe }`. `details` has location, skills, preferred
+isMe, followStatus, followsYou, canViewContent, details, impact, blockedByMe, mutedByMe }`. `impact` is
+`{ activities, hours, beneficiaries, medal }` (`null` for someone you blocked). `details` has location, skills, preferred
 areas, availability and volunteering types; gender, dateOfBirth, qualification and fieldOfStudy are added
 only for the owner or when `showPersonalDetails` is on.
 
@@ -339,6 +341,7 @@ activity "Beach cleanup"."). `url` is the app deep link (`myvolapp://post/<id>` 
 | `comment` | someone commented on your post | `notifComments` |
 | `reply` | someone replied to your comment | `notifComments` |
 | `approved` / `rejected` | a reviewer approved/rejected your post (only when its status really changes) | `notifActivityApproved` |
+| `medal` | an approval took you to a medal tier (once per tier; opens your profile) | `notifActivityApproved` |
 
 Undoing an action deletes its notification (unlike, unfollow, cancelled request, deleted comment or post).
 Repeating an action never makes a second one. You're never notified about your own actions.
@@ -386,6 +389,35 @@ A logged-out or revoked session is disconnected within 30 s.
 `npm run ws:listen -- priya_sharma Volunteer2026` logs in like the app and prints every event. Then, from
 Postman or another terminal, like or comment on one of Priya's posts as another demo user: the event shows
 up at once, with the badge count and whether a banner would show.
+
+## Impact & medals
+
+A volunteer's impact counts **approved** activities only (under review and rejected don't count), worked
+out from their posts on every request.
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/v1/users/me/impact` | Yours, including `underReview` and `rejected` counts |
+| GET | `/api/v1/users/:user/impact` | Someone else's. Totals and medals are public (like follower counts); `byCategory` is `null` if their account is private and you don't follow it. 404 if they blocked you, 403 `USER_BLOCKED` if you blocked them |
+
+```json
+{ "impact": {
+    "activities": 4, "hours": 12, "beneficiaries": 180, "likesReceived": 37,
+    "underReview": 1, "rejected": 0,
+    "byCategory": [{ "category": "Health", "activities": 3, "hours": 9, "beneficiaries": 150 }],
+    "medals": {
+      "current": { "id": "bronze", "label": "Bronze Medal", "activities": 3 },
+      "next": { "id": "silver", "label": "Silver Medal", "activities": 6, "remaining": 2 },
+      "tiers": [{ "id": "bronze", "label": "Bronze Medal", "activities": 3, "earned": true }, "…silver 6, gold 12, platinum 25"]
+    } } }
+```
+
+The app's screens map onto it like this: Home's "N activities away from…" banner = `medals.next`
+(`null` once Platinum is earned); the Impact tab = `hours`, `beneficiaries` ("People impacted"),
+`activities` ("Activities approved"), `likesReceived`, `underReview`; the profile header = `profile.impact`.
+The tiers live in `src/config/medals.js`, so the app can stop hard-coding `MEDAL_TIERS`.
+Medals follow the current count: deleting a post or having it rejected can take one away again. Reaching
+a tier sends a `medal` notification once.
 
 ## Block & mute
 

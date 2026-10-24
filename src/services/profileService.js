@@ -6,6 +6,7 @@ const AppError = require('../utils/appError');
 const audit = require('./auditService');
 const { toAvatar } = require('../lib/images');
 const { acceptAllRequests } = require('./followService');
+const impact = require('./impactService');
 const { findActiveUser, relationsFor, canView } = require('./socialGraph');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -88,15 +89,17 @@ const countPosts = (userId, isMe) => prisma.post.count({ where: { authorId: user
 // ---------- own profile ----------
 
 const getMe = async (userId) => {
-    const [user, pendingRequestsCount, postsCount] = await Promise.all([
+    const [user, pendingRequestsCount, postsCount, impactSummary] = await Promise.all([
         prisma.user.findUnique({ where: { id: userId }, select: PROFILE_SELECT }),
         prisma.followRequest.count({ where: { targetId: userId, requester: { status: 'ACTIVE' } } }),
         countPosts(userId, true),
+        impact.summaryFor(userId),
     ]);
     const nextChange = user.usernameChangedAt && new Date(user.usernameChangedAt.getTime() + env.USERNAME_CHANGE_COOLDOWN_DAYS * DAY_MS);
 
     return {
         ...toProfile(user, userId, SELF, postsCount),
+        impact: impactSummary,
         showPersonalDetails: Boolean(user.profile?.showPersonalDetails),
         pendingRequestsCount,
         usernameChangeAvailableAt: nextChange && nextChange > new Date() ? nextChange : null,
@@ -178,14 +181,17 @@ const removeAvatar = async (userId) => {
 const getProfile = async (viewerId, idOrUsername) => {
     const user = await findActiveUser(idOrUsername, { viewerId, select: PROFILE_SELECT });
     if (user.id === viewerId) return getMe(viewerId);
-    const [rel, postsCount, muted] = await Promise.all([
+    const [rel, postsCount, muted, impactSummary] = await Promise.all([
         relationsFor(viewerId, [user.id]),
         countPosts(user.id, false),
         prisma.mute.count({ where: { muterId: viewerId, mutedId: user.id } }),
+        impact.summaryFor(user.id),
     ]);
     const relation = rel(user.id);
     return {
         ...toProfile(user, viewerId, relation, relation.blockedByMe ? 0 : postsCount),
+        // Public totals, like the follower counts (impactService); none across a block.
+        impact: relation.blockedByMe ? null : impactSummary,
         blockedByMe: relation.blockedByMe,
         mutedByMe: muted > 0,
     };

@@ -8,6 +8,7 @@ const { toPostImage } = require('../lib/images');
 const { processVideo } = require('../lib/videos');
 const { afterCursor, toPage } = require('../utils/cursor');
 const notifications = require('./notificationService');
+const impact = require('./impactService');
 const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, toCard } = require('./socialGraph');
 
 // ---------- loading & visibility ----------
@@ -226,7 +227,7 @@ const createPost = async (authorId, data, files = []) => {
             rows.push(row);
         }
 
-        const post = await prisma.$transaction(async (tx) => {
+        const [post, medalId] = await prisma.$transaction(async (tx) => {
             const created = await tx.post.create({
                 data: {
                     authorId,
@@ -238,8 +239,11 @@ const createPost = async (authorId, data, files = []) => {
                 select: { id: true },
             });
             await setPostHashtags(tx, created.id, extractHashtags(data.title, data.description));
-            return tx.post.findUnique({ where: { id: created.id }, include: POST_INCLUDE });
+            // Auto-approved = approved now, so it may complete a medal tier.
+            const medal = env.POST_AUTO_APPROVE ? await impact.checkMedal(tx, authorId) : null;
+            return [await tx.post.findUnique({ where: { id: created.id }, include: POST_INCLUDE }), medal];
         });
+        notifications.deliver(medalId);
         return (await toPosts(authorId, [post]))[0];
     } catch (err) {
         await removeFiles(saved);

@@ -7,6 +7,7 @@ const AppError = require('../utils/appError');
 const { afterCursor, toPage } = require('../utils/cursor');
 const { CARD_SELECT, relationsFor, isBlockedBetween, toCard } = require('./socialGraph');
 const { getSettings } = require('./settingsService');
+const { tierById } = require('../config/medals');
 
 // The Activity tab, delivered live over our own WebSocket (lib/realtime.js).
 //
@@ -37,6 +38,7 @@ const TYPE_NAMES = {
     COMMENT_LIKE: 'comment_like',
     POST_APPROVED: 'approved',
     POST_REJECTED: 'rejected',
+    MEDAL_EARNED: 'medal',
 };
 
 // The setting (settingsService) that controls the phone banner for each type.
@@ -50,6 +52,8 @@ const ALERT_SETTING = {
     COMMENT_REPLY: 'notifComments',
     POST_APPROVED: 'notifActivityApproved',
     POST_REJECTED: 'notifActivityApproved',
+    // A medal comes from an approval, so the same switch covers it.
+    MEDAL_EARNED: 'notifActivityApproved',
 };
 
 // Unique per recipient: the same event can't be recorded twice.
@@ -61,6 +65,7 @@ const keys = {
     comment: (commentId) => `comment:${commentId}`,
     commentLike: (commentId, actorId) => `comment_like:${commentId}:${actorId}`,
     review: (postId) => `review:${postId}`,
+    medal: (tierId) => `medal:${tierId}`,
 };
 
 // ---------- recording (always inside the caller's transaction `tx`) ----------
@@ -163,6 +168,11 @@ const postReviewed = async (tx, post) => {
     return row.id;
 };
 
+// impactService.checkMedal: the user just reached a tier. Once per tier, ever (until
+// the row ages out after NOTIFICATION_RETENTION_DAYS), even if they drop below and
+// reach it again.
+const medalEarned = (tx, userId, tierId) => create(tx, { type: 'MEDAL_EARNED', recipientId: userId, dedupeKey: keys.medal(tierId) });
+
 // ---------- reading ----------
 
 const INCLUDE = {
@@ -210,13 +220,19 @@ const messageFor = (n) => {
             return `Your "${title}" activity was approved.`;
         case 'POST_REJECTED':
             return `Your "${title}" activity wasn't approved${n.post?.rejectionReason ? `: ${n.post.rejectionReason}` : '.'}`;
+        case 'MEDAL_EARNED': {
+            const tier = tierById(n.dedupeKey.slice('medal:'.length));
+            return tier ? `You earned the ${tier.label} for ${tier.activities} approved activities.` : 'You earned a medal.';
+        }
         default:
             return 'You have a new notification.';
     }
 };
 
-// Where tapping it goes: the post if there is one, otherwise the person.
+// Where tapping it goes: the post if there is one, otherwise the person (a medal opens
+// your own profile, where the Impact tab is).
 const urlFor = (n) => {
+    if (n.type === 'MEDAL_EARNED') return `${APP_SCHEME}://user/${n.recipientId}`;
     if (n.postId) return `${APP_SCHEME}://post/${n.postId}`;
     if (n.actorId) return `${APP_SCHEME}://user/${n.actorId}`;
     return null;
@@ -418,6 +434,7 @@ module.exports = {
     commentLiked,
     commentUnliked,
     postReviewed,
+    medalEarned,
     recipientsOf,
     // reading
     listNotifications,
