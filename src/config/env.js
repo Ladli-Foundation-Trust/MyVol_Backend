@@ -46,6 +46,10 @@ const schema = z.object({
     MAX_POST_VIDEO_MB: z.coerce.number().positive().max(1024).default(100),
     MAX_VIDEO_SECONDS: z.coerce.number().int().positive().max(900).default(180),
 
+    // Stories: one photo or clip, gone this many hours after it was shared.
+    STORY_LIFETIME_HOURS: z.coerce.number().int().positive().max(168).default(24),
+    STORY_MAX_VIDEO_SECONDS: z.coerce.number().int().positive().max(180).default(60),
+
     // Notifications reach the app over our own WebSocket (lib/realtime.js), no push service.
     // Quiet hours (22:00–07:00) are judged in this zone until users have their own.
     DEFAULT_TIMEZONE: z

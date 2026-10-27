@@ -6,6 +6,7 @@ router.use('/auth', require('./authRoutes'));
 router.use('/users', require('./userRoutes'));
 router.use('/posts', require('./postRoutes'));
 router.use('/comments', require('./commentRoutes'));
+router.use('/stories', require('./storyRoutes'));
 router.use('/notifications', require('./notificationRoutes'));
 router.use('/settings', require('./settingsRoutes'));
 

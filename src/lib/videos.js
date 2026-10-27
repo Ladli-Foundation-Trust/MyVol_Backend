@@ -64,11 +64,12 @@ const SCALE = `scale='if(gt(iw,ih),-2,min(${TARGET_SHORT_SIDE},iw))':'if(gt(iw,i
 
 // Returns { buffer, thumbnail, width, height, durationMs } for a video on disk.
 // -map_metadata -1 drops metadata such as the GPS location phones embed.
-const processVideo = (inputPath) =>
+// maxSeconds: posts allow MAX_VIDEO_SECONDS, stories STORY_MAX_VIDEO_SECONDS.
+const processVideo = (inputPath, { maxSeconds = env.MAX_VIDEO_SECONDS } = {}) =>
     oneAtATime(async () => {
         const source = await probe(inputPath);
-        if (source.durationMs > env.MAX_VIDEO_SECONDS * 1000) {
-            throw new AppError(`Videos can be at most ${env.MAX_VIDEO_SECONDS} seconds long`, 400, undefined, 'VIDEO_TOO_LONG');
+        if (source.durationMs > maxSeconds * 1000) {
+            throw new AppError(`Videos can be at most ${maxSeconds} seconds long`, 400, undefined, 'VIDEO_TOO_LONG');
         }
 
         const out = path.join(os.tmpdir(), `myvolapp-${crypto.randomUUID()}.mp4`);

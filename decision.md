@@ -533,20 +533,117 @@ keeps it honest: a medal always means that many approved activities right now.
 90 days (after that, re-reaching a tier could notify again). Add a `user_medals` table if medals become
 permanent awards or certificates (plan: "Later").
 
+### D58. All 45 app settings, and three of them are columns (2026-10-24)
+**Decision.** `/settings` takes every key of the app's `SETTINGS_DEFAULTS`; the validator is built from
+`settingsService.DEFAULTS` + `OPTIONS`, so a new setting is one line in each. `privateAccount`,
+`whoCanViewActivities` and `showLocationOnPosts` are stored as `users.is_private`, `users.activity_visibility`
+(CHECK: `everyone|followers|onlyMe`) and `users.show_location`; the rest stay in `user_settings.data`.
+`privateAccount` and the profile's `isPrivate` are the same column. `PATCH /settings` lives in
+`accountSettingsService` (not `settingsService`) because a follow-policy change has to approve waiting
+requests in `followService`, which itself reads settings.
+**Why.** Feeds, explore, search and the post visibility rule filter on those three in SQL. A JSON path
+filter on a missing key is NULL, and `NOT NULL` is NULL, so "not onlyMe" would silently drop every user
+who never touched the setting. Columns make the rule a plain indexed `WHERE`.
+**Trade-off.** Two homes for settings. `getSettings` / `settingsFor` hide it: callers always get one flat
+object.
+
+### D59. Privacy settings the server enforces, and the ones it only stores
+**Decision.** Enforced: `whoCanFollow` (approve = requests on a public account; none = 403
+`FOLLOWS_PAUSED`, existing followers stay; leaving approve/private approves waiting requests, through one
+`settlePendingRequests` used by both `/settings` and `PATCH /users/me`), `whoCanViewActivities`
+(`socialGraph.canViewActivities` + `postService.visibleTo`; an only-me post is a 404, a followers-only one
+403 `ACTIVITIES_FOLLOWERS_ONLY`), `showLocationOnPosts` (null location for others, and city filters and
+search skip it, or the filter would leak it), `showImpactStats`, `whoCanComment` (+ `canComment` on posts),
+`allowSharing` (+ `canShare`), `hideLikeCounts`, `suggestToOthers`, `showSuggestedVolunteers`, `feedSort`,
+`loginAlerts`. Stored only: mentions/tags/reposts (no such features), reminders/opportunities/announcements/
+digests, `showActivityStatus` (presence comes with chat), `nearbyRadius` (no geo yet), `sensitiveContent`,
+and the media/language/accessibility keys (app-side).
+**Why.** A setting the app shows must do what it says for every client, so the rules live where the data
+is. Storing the rest keeps one settings sync for the app.
+
+### D60. Hide offensive comments: flagged on write, hidden at read
+**Decision.** `config/offensiveWords.js` (short English + romanised Hindi abuse and spam-bait list, whole
+words, look-alike digits folded) sets `comments.is_offensive` when a comment is written. While the post
+author has `hideOffensiveComments` on (default), those comments are visible only to their writer; the
+author lists them with `?hidden=true`; nobody is notified about one. Counts include them.
+**Why.** This is the app's own copy ("Hidden comments are still visible to you under Hidden comments").
+Flagging once on write is cheap and lets the author flip the setting without re-scanning. The writer still
+sees their comment, so the filter doesn't invite retries.
+**Trade-off.** A word list is crude (no context, other languages). Existing comments aren't re-checked when
+the list changes. A moderation model can replace `isOffensive()` later.
+
+### D61. Home feed sort and Explore views stay chronological
+**Decision.** `feedSort`: `latest` (own + following), `following` (following only), `recommended` (latest +
+public activities in the causes of the profile's `preferredAreas`, mapped to post categories, or in the
+profile city). Explore `view`: `all`, `near` (profile city; 400 `CITY_REQUIRED` without one), `featured`
+(staff picks: `posts.featured_at`, set by `POST /admin/posts/:id/feature`, cleared by a rejection),
+`videos`. All newest first with the keyset cursor.
+**Why.** Every view pages with the same cursor and the app keeps one list component. "Recommended" without
+a ranking model is honest: it widens the feed with what the profile says the volunteer cares about.
+
+### D62. Trending ranks in the app server, over a bounded pool
+**Decision.** `GET /posts/trending?days=7`: up to 1000 newest public activities of the period, scored
+`(likes + 2·comments + 2·saves + 3·shares + views/10) / (ageHours + 2)^0.8`, zero scores dropped, offset
+cursor like search. `GET /posts/explore/stats` adds up approved activities for the community strip
+(numbers only, so private accounts count).
+**Why.** The app's "Trending now" needs a ranking, not recency, and the score formula will change; JS is
+easier to tune than SQL. The pool keeps the work bounded.
+**Trade-off.** Above ~1000 posts a week the oldest ones in the window can't trend. Move the score into a
+materialised view or a periodic job then.
+
+### D63. Stories: their own table, 24 hours, profile visibility
+**Decision.** `stories` (one photo or video, caption ≤ 200, `expires_at` = +`STORY_LIFETIME_HOURS`) and
+`story_views` (one row per viewer; `views_count` counts unique viewers, never the author). Photos and
+videos go through the same pipeline as posts (`STORY_MAX_VIDEO_SECONDS` = 60). Visibility is
+`socialGraph.canView`. The tray is you + people you follow (not muted), ordered you → unwatched → most
+recent, like the app's `selectStoryRail`. Every read filters `expires_at > now`; the cleanup job deletes
+expired rows and files (and recounts views when a viewer's account is purged). Stories can be reported
+(`type: 'story'`) and removed by staff.
+**Why.** The app keeps stories apart from posts (not reviewed, liked or commented). Filtering on read
+makes expiry exact without a timer; the job only reclaims space.
+
+### D64. Suggested volunteers in one ranked SQL query
+**Decision.** Candidates exclude you, people you follow or requested, blocks both ways, people you muted or
+dismissed (`suggestion_dismissals`), and people with `suggestToOthers` off or `whoCanFollow: none`.
+Ranked follows-you → mutual follows → same city → followers → newest. `same_city` is COALESCEd to false:
+users without a profile row would otherwise be NULL, which `DESC` sorts first. The reason text is built
+like the app's `reasonFor` ("Followed by Priya + 2 more").
+**Why.** One query with `EXISTS`/`count` subqueries is fast at this size and respects every privacy rule
+in SQL. Dismissals are stored because the app's rail forgets them on restart.
+
+### D65. Data export behind re-authentication
+**Decision.** `POST /users/me/export { password }` returns one JSON file with everything the account
+holds (no secret hashes, no reporters' identities), audited, 5 an hour.
+**Why.** DPDP/GDPR-style access right, and the app's "Download your information". It contains phone,
+email and login history, so it needs the same re-auth as deactivate/delete. Synchronous is fine at this
+size; a background job + emailed link is the move when accounts get large.
+
+### D66. Login alerts for new devices
+**Decision.** `completeLogin` counts earlier sessions with the same `deviceName` + user agent. None (and
+the account has signed in before) = a new device: audit `new_device_login` and, with `loginAlerts` on,
+email the account.
+**Why.** The app has the toggle ("Unrecognised login alerts"). Device name + agent avoids alerting on
+every IP change of a mobile network. The first login after signup isn't "new".
+**Trade-off.** Sessions are deleted 30 days after they end, so a device unused for longer alerts again.
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|
 | Two-factor auth (TOTP + backup codes) | No UI in the app yet. Recommended before public launch, at least for staff/moderator roles. |
 | Sign in with Apple | Required by App Store rules if Google sign-in ships on iOS. Android-first for now. |
 | Real SMS delivery | Phone auth is built (D30) but codes go to the console. Needs a provider (MSG91 etc.) and a DLT-registered sender in India. |
-| Suggested volunteers | Rest of Phase 8. Must use `notBlockedWith` (D49). |
+| Chat (Phase 14) and "who can message you" | Not needed yet (product decision 2026-10-24). The WebSocket in D47 is the transport it will use. |
+| Mentions, tags, reposts | No such features; `whoCanMention`, `whoCanTag`, `allowReposts`, `notifMentions` are stored (D59). |
+| Presence ("active now") | `showActivityStatus` is stored; presence belongs with chat. |
+| Geo "near you" by distance | By profile city for now (D61); needs PostGIS + coordinates. `nearbyRadius` is stored. |
+| Sensitive-content flag on posts | `sensitiveContent` is stored; posts have no flag yet. |
+| Announcements / reminders / weekly digest emails | Settings stored; no sender yet. |
 | Permanent medal awards / certificates | Medals follow the current count (D57). Needs a `user_medals` table. |
-| Who can comment / who can message you | Privacy settings. Blocks already stop both (D49). |
 | Turning off `POST_AUTO_APPROVE` | Moderation exists now (D54). It stays on until a reviewer is ready to work the queue; with it off, new posts start Under Review. |
 | Web admin panel | Staff use the `/admin` API through Postman for now (plan: "Later"). |
 | Cloud video (HLS, background processing) | Local ffmpeg for now (D41). |
 | Reels ranking | Chronological; watch time is already recorded (D42). |
-| Feed ranking / "Near me" / trending | Chronological is enough for now (D39). |
+| Feed ranking by a model | Sorts and views are chronological (D61); trending has a simple score (D62). |
 | Mention notifications | No @mentions yet. `notifMentions` is already stored (D46). |
 | Grouped notifications ("X and 12 others") | Read-time grouping over the same rows when needed (D44). |
 | Notifications while the app is closed | Needs FCM/APNs, declined for now (D47). The app catches up on open. |
@@ -554,7 +651,7 @@ permanent awards or certificates (plan: "Later").
 | Per-user time zone for quiet hours | `DEFAULT_TIMEZONE` until settings have a time zone (D45). |
 | S3/CDN storage | Swap `src/lib/storage.js` when a bucket exists (D34). |
 | Removing a phone / freeing a slot | Not needed yet. Deleting the account frees the slot after the grace period. |
-| "New login from X" emails | Needs device fingerprinting to avoid spam. The audit log already has the data. |
+| Login alerts by SMS for phone-only accounts | Email only (D66); no SMS provider yet. |
 | Breached-password check (HIBP) | See D24. |
 | Redis-backed rate limits | Only needed once there is more than one instance (D22). |
 | CAPTCHA / Play Integrity on signup | Add if bot sign-ups show up in `auth_events`. |

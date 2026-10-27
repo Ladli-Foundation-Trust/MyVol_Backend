@@ -6,10 +6,12 @@ const storage = require('../lib/storage');
 const AppError = require('../utils/appError');
 const { toPostImage } = require('../lib/images');
 const { processVideo } = require('../lib/videos');
-const { afterCursor, toPage } = require('../utils/cursor');
+const { afterCursor, toPage, decodeOffset, offsetPage } = require('../utils/cursor');
 const notifications = require('./notificationService');
 const impact = require('./impactService');
-const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, toCard } = require('./socialGraph');
+const { getSettings, settingsFor } = require('./settingsService');
+const { AREA_CATEGORIES } = require('../validators/postValidators');
+const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, canViewActivities, toCard } = require('./socialGraph');
 
 // ---------- loading & visibility ----------
 
@@ -23,14 +25,25 @@ const POST_INCLUDE = {
 };
 
 // Enough to decide whether someone may see or react to a post.
-const ACCESS_SELECT = { id: true, authorId: true, status: true, author: { select: { id: true, isPrivate: true, status: true } } };
+const ACCESS_SELECT = {
+    id: true,
+    authorId: true,
+    status: true,
+    author: { select: { id: true, isPrivate: true, activityVisibility: true, status: true } },
+};
 
 const postNotFound = () => new AppError('Post not found', 404, undefined, 'POST_NOT_FOUND');
 
+const activitiesHidden = (user) =>
+    user.activityVisibility === 'onlyMe'
+        ? new AppError('This volunteer keeps their activities private', 403, undefined, 'ACTIVITIES_HIDDEN')
+        : new AppError('Only followers can see these activities', 403, undefined, 'ACTIVITIES_FOLLOWERS_ONLY');
+
 // Who may see a post: its author always (any status). Anyone else only if it is
 // APPROVED, the author is active, there is no block between them (404, as if it didn't
-// exist) and the author's profile is visible to them (public, or approved follower:
-// socialGraph.canView).
+// exist), the author's profile is visible to them (public, or approved follower:
+// socialGraph.canView) and the author's whoCanViewActivities lets them in
+// (socialGraph.canViewActivities; an 'onlyMe' post is a 404 like a deleted one).
 const findVisiblePost = async (viewerId, postId, query = { select: ACCESS_SELECT }) => {
     const post = await prisma.post.findUnique({ where: { id: postId }, ...query });
     if (!post) throw postNotFound();
@@ -42,20 +55,44 @@ const findVisiblePost = async (viewerId, postId, query = { select: ACCESS_SELECT
     if (!canView(viewerId, post.author, relation)) {
         throw new AppError('This account is private', 403, undefined, 'PRIVATE_ACCOUNT');
     }
+    if (!canViewActivities(viewerId, post.author, relation)) {
+        if (post.author.activityVisibility === 'onlyMe') throw postNotFound();
+        throw activitiesHidden(post.author);
+    }
     return post;
 };
 
-// The same rule as a Prisma `where`, for lists of posts.
+// The same rule as a Prisma `where`, for lists of posts: the viewer's own posts, plus
+// approved posts whose author is public with activities for everyone, or followed by
+// the viewer with activities for everyone or followers.
 const visibleTo = (viewerId) => ({
     author: { status: 'ACTIVE', ...notBlockedWith(viewerId) },
     OR: [
         { authorId: viewerId },
         {
             status: 'APPROVED',
-            author: { OR: [{ isPrivate: false }, { followers: { some: { followerId: viewerId } } }] },
+            author: {
+                OR: [
+                    { isPrivate: false, activityVisibility: 'everyone' },
+                    { activityVisibility: { in: ['everyone', 'followers'] }, followers: { some: { followerId: viewerId } } },
+                ],
+            },
         },
     ],
 });
+
+// Authors the viewer muted: their posts leave the feeds, but stay reachable on their
+// profile, by link and in search (Instagram's behaviour).
+const notMutedBy = (viewerId) => ({ mutesReceived: { none: { muterId: viewerId } } });
+
+// Explore, trending, near you: public accounts that share their activities with everyone.
+const publicActivities = (viewerId) => ({
+    status: 'APPROVED',
+    author: { status: 'ACTIVE', isPrivate: false, activityVisibility: 'everyone', ...notBlockedWith(viewerId), ...notMutedBy(viewerId) },
+});
+
+// Location filters (explore city, near you, search) only match authors who show it.
+const locationContains = (city) => ({ location: { contains: city, mode: 'insensitive' }, author: { showLocation: true } });
 
 const findOwnPost = async (viewerId, postId) => {
     const post = await prisma.post.findUnique({ where: { id: postId }, include: { media: { select: { key: true, thumbnailKey: true } } } });
@@ -66,21 +103,37 @@ const findOwnPost = async (viewerId, postId) => {
 
 // ---------- response shape ----------
 
-// Posts as the app shows them, with likedByMe/savedByMe and the author's follow
-// state, in three extra queries for the whole page.
+// The author's whoCanComment against the viewer: 'followers' = the viewer follows the
+// author, 'following' = the author follows the viewer. Authors can always comment.
+// `relation` is rel(authorId) from relationsFor.
+const commentAllowed = (policy, isMine, relation) => {
+    if (isMine) return true;
+    if (policy === 'off') return false;
+    if (policy === 'followers') return relation.followStatus === 'following';
+    if (policy === 'following') return relation.followsYou;
+    return true;
+};
+
+// Posts as the app shows them, with likedByMe/savedByMe, the author's follow state and
+// the author's post settings (location, like count, comments, sharing), in four extra
+// queries for the whole page.
 const toPosts = async (viewerId, posts) => {
     if (posts.length === 0) return [];
     const ids = posts.map((p) => p.id);
-    const [likes, saves, rel] = await Promise.all([
+    const authorIds = [...new Set(posts.map((p) => p.authorId))];
+    const [likes, saves, rel, prefsOf] = await Promise.all([
         prisma.postLike.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true } }),
         prisma.postSave.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true } }),
-        relationsFor(viewerId, [...new Set(posts.map((p) => p.authorId))]),
+        relationsFor(viewerId, authorIds),
+        settingsFor(authorIds),
     ]);
     const liked = new Set(likes.map((l) => l.postId));
     const saved = new Set(saves.map((s) => s.postId));
 
     return posts.map((p) => {
         const isMine = p.authorId === viewerId;
+        const prefs = prefsOf(p.authorId);
+        const likesHidden = !isMine && prefs.hideLikeCounts;
         return {
             id: p.id,
             author: toCard(p.author, viewerId, rel),
@@ -95,20 +148,27 @@ const toPosts = async (viewerId, posts) => {
             isReel: p.isReel,
             title: p.title,
             description: p.description,
-            location: p.location,
+            // showLocationOnPosts off: only the author sees where it was.
+            location: isMine || prefs.showLocationOnPosts ? p.location : null,
             category: p.category,
             beneficiaries: p.beneficiaries,
             hours: p.hours,
             hashtags: p.hashtags.map((h) => h.hashtag.name),
             status: p.status,
             ...(isMine && p.rejectionReason && { rejectionReason: p.rejectionReason }),
-            likesCount: p.likesCount,
+            featured: Boolean(p.featuredAt),
+            // hideLikeCounts on: only the author sees the number (the likers list stays).
+            likesCount: likesHidden ? null : p.likesCount,
+            likesHidden,
             commentsCount: p.commentsCount,
             savesCount: p.savesCount,
             sharesCount: p.sharesCount,
             viewsCount: p.viewsCount,
             likedByMe: liked.has(p.id),
             savedByMe: saved.has(p.id),
+            commentPolicy: prefs.whoCanComment,
+            canComment: commentAllowed(prefs.whoCanComment, isMine, rel(p.authorId)),
+            canShare: isMine || prefs.allowSharing,
             isMine,
             createdAt: p.createdAt,
             editedAt: p.editedAt,
@@ -306,45 +366,136 @@ const getPost = async (viewerId, postId) => {
 
 // ---------- feeds (newest first, cursor-paginated) ----------
 
-// Authors the viewer muted: their posts leave the feeds, but stay reachable on their
-// profile, by link and in search (Instagram's behaviour).
-const notMutedBy = (viewerId) => ({ mutesReceived: { none: { muterId: viewerId } } });
+// Approved posts from people the viewer follows (and hasn't muted) who share their
+// activities with followers. Blocking removes follows both ways, so blocked people
+// can't appear here.
+const fromFollowing = (viewerId) => ({
+    status: 'APPROVED',
+    author: { followers: { some: { followerId: viewerId } }, activityVisibility: { not: 'onlyMe' }, ...notMutedBy(viewerId) },
+});
 
-// Home: your own posts plus approved posts from people you follow (and haven't muted).
-// Blocking removes follows both ways, so blocked people can't appear here.
-const homeFeed = (viewerId, query) =>
-    pageOfPosts(
+// What "recommended" adds to the people you follow: public activities in the causes of
+// your profile's preferredAreas, or in your city. Null when the profile has neither.
+const interestsOf = async (viewerId) => {
+    const profile = await prisma.profile.findUnique({ where: { userId: viewerId }, select: { preferredAreas: true, city: true } });
+    const categories = [...new Set((profile?.preferredAreas ?? []).flatMap((area) => AREA_CATEGORIES[area] ?? []))];
+    const or = [...(categories.length ? [{ category: { in: categories } }] : []), ...(profile?.city ? [locationContains(profile.city)] : [])];
+    return or.length ? { AND: [publicActivities(viewerId), { OR: or }] } : null;
+};
+
+// Home, by the feedSort setting (or ?sort=), always newest first so it pages with the
+// keyset cursor:
+//   latest       your own posts + people you follow
+//   following    people you follow only
+//   recommended  latest + public posts matching your interests (interestsOf)
+const homeFeed = async (viewerId, { sort, ...query }) => {
+    const mode = sort ?? (await getSettings(viewerId)).feedSort;
+    const sources = mode === 'following' ? [fromFollowing(viewerId)] : [{ authorId: viewerId }, fromFollowing(viewerId)];
+    if (mode === 'recommended') {
+        const interests = await interestsOf(viewerId);
+        if (interests) sources.push(interests);
+    }
+    const page = await pageOfPosts(viewerId, { author: { status: 'ACTIVE' }, OR: sources }, query);
+    return { sort: mode, ...page };
+};
+
+// Explore: approved posts from public accounts, optionally by categories and city, in
+// one of the app's views: all, near (the city on the viewer's profile), featured (staff
+// picks) or videos.
+const exploreFeed = async (viewerId, { categories, city, view = 'all', ...query }) => {
+    let nearCity = null;
+    if (view === 'near') {
+        const profile = await prisma.profile.findUnique({ where: { userId: viewerId }, select: { city: true } });
+        nearCity = profile?.city;
+        if (!nearCity) {
+            throw new AppError('Add your city to your profile to see activities near you', 400, undefined, 'CITY_REQUIRED');
+        }
+    }
+    const page = await pageOfPosts(
         viewerId,
         {
-            author: { status: 'ACTIVE' },
-            OR: [
-                { authorId: viewerId },
-                { status: 'APPROVED', author: { followers: { some: { followerId: viewerId } }, ...notMutedBy(viewerId) } },
+            AND: [
+                publicActivities(viewerId),
+                categories?.length ? { category: { in: categories } } : {},
+                city ? locationContains(city) : {},
+                nearCity ? locationContains(nearCity) : {},
+                view === 'featured' ? { featuredAt: { not: null } } : {},
+                view === 'videos' ? { media: { some: { type: 'VIDEO' } } } : {},
             ],
         },
         query,
     );
+    return { view, ...(nearCity && { city: nearCity }), ...page };
+};
 
-// Explore: approved posts from public accounts, optionally by categories and city.
-const exploreFeed = (viewerId, { categories, city, ...query }) =>
-    pageOfPosts(
-        viewerId,
-        {
-            status: 'APPROVED',
-            author: { status: 'ACTIVE', isPrivate: false, ...notBlockedWith(viewerId), ...notMutedBy(viewerId) },
-            ...(categories?.length && { category: { in: categories } }),
-            ...(city && { location: { contains: city, mode: 'insensitive' } }),
+// Trending: the most engaged public activities of the last `days` days. Ranked in JS
+// over at most TRENDING_POOL candidates (likes + 2×comments + 2×saves + 3×shares +
+// views/10, decayed by age), so it pages by offset like search.
+const TRENDING_POOL = 1000;
+const trendingScore = (p, now) => {
+    const engagement = p.likesCount + 2 * p.commentsCount + 2 * p.savesCount + 3 * p.sharesCount + p.viewsCount / 10;
+    const ageHours = (now - p.createdAt.getTime()) / 3_600_000;
+    return engagement / (ageHours + 2) ** 0.8;
+};
+
+const trendingPosts = async (viewerId, { days, cursor, limit }) => {
+    const offset = decodeOffset(cursor);
+    const candidates = await prisma.post.findMany({
+        where: { ...publicActivities(viewerId), createdAt: { gte: new Date(Date.now() - days * 86_400_000) } },
+        orderBy: { createdAt: 'desc' },
+        take: TRENDING_POOL,
+        select: { id: true, createdAt: true, likesCount: true, commentsCount: true, savesCount: true, sharesCount: true, viewsCount: true },
+    });
+    const now = Date.now();
+    const ranked = candidates
+        .map((p) => ({ id: p.id, score: trendingScore(p, now) }))
+        .filter((p) => p.score > 0)
+        .sort((a, b) => b.score - a.score || (a.id < b.id ? 1 : -1));
+    const { items, nextCursor } = offsetPage(ranked.slice(offset, offset + limit + 1), offset, limit);
+
+    const rows = await prisma.post.findMany({ where: { id: { in: items.map((p) => p.id) } }, include: POST_INCLUDE });
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    return { days, posts: await toPosts(viewerId, items.map((p) => byId.get(p.id)).filter(Boolean)), nextCursor };
+};
+
+// Explore's community strip: totals over every approved activity of active accounts
+// (numbers only, so private accounts count too), plus activities per cause.
+const exploreStats = async () => {
+    const [[totals], byCategory] = await Promise.all([
+        prisma.$queryRaw`
+            SELECT count(*)::int AS activities,
+                   COALESCE(sum(p.beneficiaries), 0)::int AS beneficiaries,
+                   COALESCE(sum(p.hours), 0)::int AS hours,
+                   count(DISTINCT p.author_id)::int AS volunteers,
+                   count(DISTINCT lower(trim(split_part(p.location, ',', 1))))
+                       FILTER (WHERE u.show_location AND trim(coalesce(p.location, '')) <> '')::int AS cities
+            FROM posts p JOIN users u ON u.id = p.author_id
+            WHERE p.status = 'APPROVED' AND u.status = 'ACTIVE'`,
+        prisma.post.groupBy({
+            by: ['category'],
+            where: { status: 'APPROVED', author: { status: 'ACTIVE' } },
+            _count: { _all: true },
+        }),
+    ]);
+    return {
+        stats: {
+            ...totals,
+            byCategory: byCategory
+                .map((r) => ({ category: r.category, activities: r._count._all }))
+                .sort((a, b) => b.activities - a.activities || a.category.localeCompare(b.category)),
         },
-        query,
-    );
+    };
+};
 
-// A profile's grid. The owner also sees posts under review or rejected.
+// A profile's grid. The owner also sees posts under review or rejected. Others need the
+// profile to be visible (canView) and the owner's whoCanViewActivities to let them in.
 const userPosts = async (viewerId, idOrUsername, query) => {
     const user = await findActiveUser(idOrUsername, { viewerId });
-    const rel = await relationsFor(viewerId, [user.id]);
-    if (!canView(viewerId, user, rel(user.id))) {
+    const relation = (await relationsFor(viewerId, [user.id]))(user.id);
+    if (!canView(viewerId, user, relation)) {
         throw new AppError('This account is private', 403, undefined, 'PRIVATE_ACCOUNT');
     }
+    if (!canViewActivities(viewerId, user, relation)) throw activitiesHidden(user);
     return pageOfPosts(viewerId, { authorId: user.id, ...(user.id !== viewerId && { status: 'APPROVED' }) }, query);
 };
 
@@ -352,8 +503,9 @@ const userPosts = async (viewerId, idOrUsername, query) => {
 const hashtagFeed = (viewerId, tag, query) =>
     pageOfPosts(viewerId, { hashtags: { some: { hashtag: { name: tag } } }, ...visibleTo(viewerId) }, query);
 
-// Search: visible posts whose title, description, location, category, hashtags or
-// author's name contain `q` (case-insensitive; trigram indexes keep it fast). Newest
+// Search: visible posts whose title, description, location (if the author shows it),
+// category, hashtags or author's name contain `q` (case-insensitive; trigram indexes
+// keep it fast). Newest
 // first, so it pages with the same cursor as the feeds.
 const searchPosts = (viewerId, q, query) => {
     const like = { contains: q, mode: 'insensitive' };
@@ -366,7 +518,7 @@ const searchPosts = (viewerId, q, query) => {
                     OR: [
                         { title: like },
                         { description: like },
-                        { location: like },
+                        locationContains(q),
                         { category: like },
                         { author: { name: like } },
                         { hashtags: { some: { hashtag: { name: { contains: q.toLowerCase() } } } } },
@@ -460,9 +612,13 @@ const savePost = async (viewerId, postId) => ({ saved: true, savesCount: await s
 const unsavePost = async (viewerId, postId) => ({ saved: false, savesCount: await saves.remove(viewerId, postId) });
 
 // Counts taps on "Share" (the app opens the phone's share sheet). Not de-duplicated,
-// like Instagram's send count; the engagement rate limit caps abuse.
+// like Instagram's send count; the engagement rate limit caps abuse. Refused when the
+// author turned allowSharing off (the author can always share their own).
 const sharePost = async (viewerId, postId) => {
-    await findVisiblePost(viewerId, postId);
+    const post = await findVisiblePost(viewerId, postId);
+    if (post.authorId !== viewerId && !(await getSettings(post.authorId)).allowSharing) {
+        throw new AppError("This volunteer doesn't allow sharing their posts", 403, undefined, 'SHARING_DISABLED');
+    }
     const { sharesCount } = await prisma.post.update({
         where: { id: postId },
         data: { sharesCount: { increment: 1 } },
@@ -488,6 +644,7 @@ module.exports = {
     POST_INCLUDE,
     toPosts,
     findVisiblePost,
+    commentAllowed,
     extractHashtags,
     hashtagFeed,
     searchPosts,
@@ -497,6 +654,8 @@ module.exports = {
     getPost,
     homeFeed,
     exploreFeed,
+    trendingPosts,
+    exploreStats,
     userPosts,
     savedPosts,
     reelsFeed,

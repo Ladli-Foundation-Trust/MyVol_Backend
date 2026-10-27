@@ -1,10 +1,11 @@
 const express = require('express');
 const validate = require('../middleware/validate');
 const { protect } = require('../middleware/auth');
-const { updateSettings } = require('../validators/notificationValidators');
+const { updateSettings } = require('../validators/settingsValidators');
 const n = require('../controllers/notificationController');
 
-// The app's Settings & Activity values. Only the notification keys exist so far.
+// The app's Settings & Activity values: every key of its settingsSlice
+// (settingsService.DEFAULTS). PATCH takes any subset.
 const router = express.Router();
 router.use(protect);
 

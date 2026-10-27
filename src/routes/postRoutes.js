@@ -17,8 +17,10 @@ const list = validate({ query: listQuery });
 router.post('/', requireVerified, limits.postLimiter, postUpload, validate({ body: schemas.createPost }), p.create);
 
 // Fixed paths before /:postId.
-router.get('/feed', list, p.feed);
+router.get('/feed', validate({ query: schemas.feedQuery }), p.feed);
 router.get('/explore', validate({ query: schemas.exploreQuery }), p.explore);
+router.get('/explore/stats', p.exploreStats);
+router.get('/trending', validate({ query: schemas.trendingQuery }), p.trending);
 router.get('/saved', list, p.saved);
 router.get('/reels', list, p.reels);
 
@@ -34,7 +36,7 @@ router.delete('/:postId/save', limits.engagementLimiter, post, p.unsave);
 router.post('/:postId/share', limits.engagementLimiter, post, p.share);
 router.post('/:postId/view', limits.engagementLimiter, post, validate({ body: schemas.recordView }), p.view);
 
-router.get('/:postId/comments', post, list, p.comments);
+router.get('/:postId/comments', post, validate({ query: schemas.commentListQuery }), p.comments);
 router.post('/:postId/comments', requireVerified, limits.commentLimiter, post, validate({ body: schemas.addComment }), p.addComment);
 
 module.exports = router;

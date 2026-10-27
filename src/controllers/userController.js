@@ -2,6 +2,9 @@ const profiles = require('../services/profileService');
 const follows = require('../services/followService');
 const blocks = require('../services/blockService');
 const impact = require('../services/impactService');
+const stories = require('../services/storyService');
+const suggestions = require('../services/suggestionService');
+const exporter = require('../services/exportService');
 
 const ok = (res, data) => res.json({ status: 'success', data });
 
@@ -65,6 +68,21 @@ exports.mute = async (req, res) => ok(res, await blocks.mute(req.user.id, req.pa
 exports.unmute = async (req, res) => ok(res, await blocks.unmute(req.user.id, req.params.user));
 exports.listBlocked = async (req, res) => ok(res, await blocks.listBlocked(req.user.id, req.validatedQuery));
 exports.listMuted = async (req, res) => ok(res, await blocks.listMuted(req.user.id, req.validatedQuery));
+
+// ---------- suggestions, stories, export ----------
+
+exports.suggestions = async (req, res) => ok(res, await suggestions.listSuggestions(req.user.id, req.validatedQuery));
+exports.dismissSuggestion = async (req, res) => ok(res, await suggestions.dismiss(req.user.id, req.params.userId));
+exports.stories = async (req, res) => ok(res, await stories.userStories(req.user.id, req.params.user));
+
+// A JSON file download ("Download your information").
+exports.exportData = async (req, res) => {
+    const data = await exporter.exportData(req.user, req.body, ctx(req));
+    const date = data.exportedAt.slice(0, 10);
+    res.set('Content-Disposition', `attachment; filename="myvolapp-${data.account.username}-${date}.json"`);
+    res.set('Cache-Control', 'no-store');
+    ok(res, data);
+};
 
 exports.removeFollower = async (req, res) => {
     await follows.removeFollower(req.user.id, req.params.user);

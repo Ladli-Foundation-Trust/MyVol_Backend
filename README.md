@@ -32,6 +32,7 @@ Phone: `npm run adb:reverse` from the app folder so `localhost:3000` reaches thi
 | `npm run db:studio` | Prisma Studio GUI on http://localhost:5555 |
 | `npm run db:seed` | Run `prisma/seed.js` |
 | `npm run db:seed:demo` | Demo volunteers with reels, photo posts, follows, likes, comments (see "Videos & reels") |
+| `npm run db:seed:e2e` | Named test accounts (`e2e_*`, password `Volunteer@2026`) that each show one state or rule: staff, private / followers-only / only-me profiles, follow policies, blocks, mutes, posts in every status, stories, hidden comments, open reports, suspended / locked / deactivated accounts. `-- --reset` recreates them. See [TESTING.md](TESTING.md) |
 | `npm test` | Migrate the test DB, then run the integration tests (`test/`) |
 | `npm run auth:cleanup` | Purge expired tokens/codes and accounts past their deletion date |
 | `npm run db:clean-postman` | List the test users Postman runs create (`pm_…`/`ph_…`/`em_…` @example.com); add `-- --yes` to delete them. Refuses in production |
@@ -45,19 +46,29 @@ Keep it updated with every new endpoint (new features get new numbered folders).
 
 1. In `.env`: `EXPOSE_OTP_IN_RESPONSE=true` (codes are then also returned as `data.devOtp`). The server
    refuses to start with it in production.
-2. `npm run dev`
-3. From this folder, run `postman collection run postman/MyVolApp-API.postman_collection.json`, or
-   import it into the Postman app and use the Collection Runner (~95 s, 290 requests).
+2. `npm run db:seed:e2e` (the staff account the collection logs in with, and the accounts folder S checks)
+3. `npm run dev`
+4. From this folder, run `postman collection run postman/MyVolApp-API.postman_collection.json`, or
+   import it into the Postman app and use the Collection Runner (~3 min, 462 requests).
+
+**Every JSON request carries its other possible bodies as commented-out alternatives** under the active
+one, each labelled with what it tests and the expected result (the first request of an endpoint has the
+full list, later ones point to it). Comment out the active body, uncomment one, Send: Postman strips the
+comments. List and search requests have their optional query params as unticked rows; uploads have their
+optional fields and bad files as unticked rows. [TESTING.md](TESTING.md) walks through every feature,
+rule and request.
 
 Folders 0–10 cover auth: verify email, refresh + reuse detection, sessions, change/forgot/reset password,
 change email, logout, deactivate/delete, lockout, Google, then phone signup/login/multi-account/reset/
 add-phone (waits 61 s once for the code cooldown). Folders 11–16 cover profiles and follow, 17–21 posts,
 feeds, likes, saves, shares and comments, 22 videos and reels (uploads read `postman/fixtures/`),
 23 notifications and settings (the runner can't open WebSockets: watch live events with `npm run ws:listen`),
-24 block and mute, 25 search and hashtags, 26 reports and moderation, 27 impact and medals. Folder 26's staff requests log in
-with the collection variables `adminLogin` / `adminPassword` (locally: `dev_admin`, made with
-`npm run user:role -- dev_admin ADMIN`); without them those requests are skipped. They make B a reviewer
-and then a user again.
+24 block and mute, 25 search and hashtags, 26 reports and moderation, 27 impact and medals, 28 every setting
+and the privacy rules it drives, 29 stories, 30 suggested volunteers, 31 feed sort / explore views /
+trending / community stats / featured posts, 32 data export and login alerts, S the seeded accounts.
+Staff requests log in with the collection variables `adminLogin` / `adminPassword` (default: the seeded
+`e2e_admin` / `Volunteer@2026`; any admin made with `npm run user:role -- <username> ADMIN` works); if
+`adminLogin` is empty those requests are skipped. They make B a reviewer and then a user again.
 The collection is git-ignored (local only), like every `.env*` file.
 Tokens and codes are saved into collection variables, so single requests also work by hand.
 Google sign-in runs only when the `googleIdToken` variable is set (see that folder's description).
@@ -90,7 +101,13 @@ src/lib/videos.js       video probe/transcode/cover (bundled ffmpeg), one at a t
 src/services/postService.js     posts, feeds, likes/saves/shares, the post visibility rule
 src/services/commentService.js  comments, replies, comment likes
 src/services/notificationService.js  Activity list, recording events, live delivery + banner rules
-src/services/settingsService.js app settings (JSONB, defaults merged at read time)
+src/services/settingsService.js app settings (all 45 app keys: JSONB + 3 users columns, defaults merged at read time)
+src/services/accountSettingsService.js  PATCH /settings (and what a follow-policy change does to pending requests)
+src/services/storyService.js    stories, the tray, seen + viewers
+src/services/suggestionService.js  "Suggested for you"
+src/services/exportService.js   "Download your information"
+src/config/offensiveWords.js    the hideOffensiveComments word list
+scripts/seed-e2e.js     named end-to-end test accounts (npm run db:seed:e2e)
 src/lib/realtime.js     our WebSocket server (/api/v1/ws): login, devices per user, heartbeat
 scripts/ws-listen.js    prints live events for a user (npm run ws:listen)
 uploads/                avatars and post photos in development (git-ignored)
@@ -195,10 +212,18 @@ Base `/api/v1/users`. **Every route needs `Authorization: Bearer`.** `:user` is 
 | POST / DELETE | `/:user/mute` | – | → `{ muted }` |
 | GET | `/me/blocked`, `/me/muted` | `?cursor&limit` | Settings lists, newest first (rows add `blockedAt` / `mutedAt`) |
 | GET | `/me/impact`, `/:user/impact` | – | See "Impact & medals" |
+| GET | `/me/suggestions` | `?limit` (1–30, default 10) | See "Suggested volunteers" |
+| POST | `/me/suggestions/:userId/dismiss` | – | The card's ✕; never suggested again |
+| GET | `/:user/stories` | – | Their live stories, oldest first. See "Stories" |
+| POST | `/me/export` | `{ password }` | "Download your information": a JSON file. See "Data export & login alerts" |
 
 Profile shape: `{ id, username, name, bio, avatarUrl, isPrivate, followersCount, followingCount, createdAt,
-isMe, followStatus, followsYou, canViewContent, details, impact, blockedByMe, mutedByMe }`. `impact` is
-`{ activities, hours, beneficiaries, medal }` (`null` for someone you blocked). `details` has location, skills, preferred
+isMe, followStatus, followsYou, canViewContent, canViewActivities, details, impact, stories, blockedByMe,
+mutedByMe, followRequiresApproval, followsPaused }`. `impact` is `{ activities, hours, beneficiaries, medal }`
+(`null` for someone you blocked, or when they turned `showImpactStats` off). `canViewActivities` = may the
+viewer open the posts grid (`whoCanViewActivities`). `stories` = `{ count, hasUnseen }` for the avatar ring.
+`followRequiresApproval` / `followsPaused` drive the follow button ("Request" / disabled) from the owner's
+`privateAccount` and `whoCanFollow`. `details` has location, skills, preferred
 areas, availability and volunteering types; gender, dateOfBirth, qualification and fieldOfStudy are added
 only for the owner or when `showPersonalDetails` is on.
 
@@ -230,8 +255,10 @@ verified email or phone (403 `EMAIL_NOT_VERIFIED`); liking, saving and sharing d
 | Method | Path | Body / query | Notes |
 |---|---|---|---|
 | POST | `/posts` | multipart: `title, category, description?, location?, beneficiaries?, hours?` + up to 6 files in `media`; or the same fields as JSON for a text-only post | Photos → WebP, longest side 1440 px, metadata stripped. No photos ⇒ description required |
-| GET | `/posts/feed` | `?cursor&limit` | Your posts + approved posts of people you follow, newest first |
-| GET | `/posts/explore` | `?category=A,B&city=X&cursor&limit` | Approved posts from public accounts |
+| GET | `/posts/feed` | `?sort&cursor&limit` | Newest first. `sort` (default: the `feedSort` setting): `latest` = yours + people you follow; `following` = people you follow only; `recommended` = latest + public posts in your profile's causes (`preferredAreas`) or city. Response adds `sort` |
+| GET | `/posts/explore` | `?view&category=A,B&city=X&cursor&limit` | Approved posts from public accounts that share activities with everyone. `view`: `all` (default), `near` (your profile city; 400 `CITY_REQUIRED` without one; response adds `city`), `featured` (staff picks), `videos` |
+| GET | `/posts/trending` | `?days` (1–30, default 7), `limit` (default 10), `cursor` | Most engaged public activities of the period (likes + 2×comments + 2×saves + 3×shares + views/10, decayed by age). Offset cursor |
+| GET | `/posts/explore/stats` | – | The community strip: `{ stats: { activities, beneficiaries, hours, volunteers, cities, byCategory } }` |
 | GET | `/posts/saved` | `?cursor&limit` | Newest save first |
 | GET | `/posts/:postId` | – | |
 | PATCH | `/posts/:postId` | any of `title, description, location, category, beneficiaries, hours` | Author only; sets `editedAt` |
@@ -240,8 +267,8 @@ verified email or phone (403 `EMAIL_NOT_VERIFIED`); liking, saving and sharing d
 | GET | `/posts/:postId/likes` | `?cursor&limit` | Who liked it (user cards) |
 | POST / DELETE | `/posts/:postId/save` | – | → `{ saved, savesCount }` |
 | POST | `/posts/:postId/share` | – | → `{ sharesCount }` (counts share-sheet taps) |
-| GET | `/posts/:postId/comments` | `?cursor&limit` | Top-level comments, oldest first, each with `repliesCount` |
-| POST | `/posts/:postId/comments` | `text` (1–1000), `parentId?` | Reply to a reply attaches to the same top-level comment |
+| GET | `/posts/:postId/comments` | `?hidden&cursor&limit` | Top-level comments, oldest first, each with `repliesCount`. `?hidden=true`: the post author's "Hidden comments" (403 `NOT_AUTHOR` for others) |
+| POST | `/posts/:postId/comments` | `text` (1–1000), `parentId?` | Reply to a reply attaches to the same top-level comment. The post author's `whoCanComment` applies (403 `COMMENTS_OFF` / `COMMENTS_RESTRICTED`) |
 | GET | `/comments/:commentId/replies` | `?cursor&limit` | Oldest first |
 | DELETE | `/comments/:commentId` | – | Comment author or post author; deletes its replies too |
 | POST / DELETE | `/comments/:commentId/like` | – | → `{ liked, likesCount }` |
@@ -249,17 +276,26 @@ verified email or phone (403 `EMAIL_NOT_VERIFIED`); liking, saving and sharing d
 
 Post shape: `{ id, author (user card), media: [{ id, type: 'image', url, width, height }], title,
 description, location, category, beneficiaries, hours, status, likesCount, commentsCount, savesCount,
-sharesCount, likedByMe, savedByMe, isMine, hashtags, createdAt, editedAt }`. `hashtags` are the `#tags`
+sharesCount, likedByMe, savedByMe, isMine, hashtags, featured, likesHidden, commentPolicy, canComment,
+canShare, createdAt, editedAt }`. The author's settings shape it for everyone else: `location` is `null`
+when `showLocationOnPosts` is off, `likesCount` is `null` (and `likesHidden: true`) when `hideLikeCounts` is
+on, `canShare` is false when `allowSharing` is off, and `canComment` / `commentPolicy` follow
+`whoCanComment`. `hashtags` are the `#tags`
 found in the title and description (lower-case, without `#`). `status` is `APPROVED`,
 `UNDER_REVIEW` or `REJECTED` (the app shows "Approved", "Under Review", "Rejected").
 Categories: Health, Animal Welfare, Hunger & Poverty, Drug Prevention, Education, Gender Equality,
 Youth & Sports, Child Rights, Environment.
 
-Comment shape: `{ id, postId, parentId, text, author, likesCount, likedByMe, repliesCount, createdAt, canDelete }`.
+Comment shape: `{ id, postId, parentId, text, author, likesCount, likedByMe, repliesCount, hidden, createdAt, canDelete }`.
+`hidden: true` marks an offensive comment (`src/config/offensiveWords.js`) on a post whose author has
+`hideOffensiveComments` on: only its writer sees it in the thread, the post author sees it under Hidden
+comments, and nobody is notified about it.
 
 Who sees a post (`postService.findVisiblePost` / `visibleTo`): its author always; others only when it is
-APPROVED, the author is active, there is no block between them, and the author's profile is visible to
-them (public, or approved follower). `POST_AUTO_APPROVE=true` (the default) approves posts on creation;
+APPROVED, the author is active, there is no block between them, the author's profile is visible to
+them (public, or approved follower), and the author's `whoCanViewActivities` lets them in (`everyone`;
+`followers` = approved followers only, 403 `ACTIVITIES_FOLLOWERS_ONLY`; `onlyMe` = nobody, 404 on a post,
+403 `ACTIVITIES_HIDDEN` on the grid). `POST_AUTO_APPROVE=true` (the default) approves posts on creation;
 set it to `false` once reviewers work the queue (see "Reports & moderation"). Editing a rejected post
 always sends it back to review.
 
@@ -267,6 +303,10 @@ always sends it back to review.
 |---|---|---|
 | 404 | `POST_NOT_FOUND`, `COMMENT_NOT_FOUND` | doesn't exist or you can't see it |
 | 403 | `PRIVATE_ACCOUNT` | private author you don't follow |
+| 403 | `ACTIVITIES_FOLLOWERS_ONLY`, `ACTIVITIES_HIDDEN` | the author's `whoCanViewActivities` |
+| 403 | `COMMENTS_OFF`, `COMMENTS_RESTRICTED` | the author's `whoCanComment` |
+| 403 | `SHARING_DISABLED` | the author turned `allowSharing` off |
+| 400 | `CITY_REQUIRED` | explore `view=near` without a city on your profile |
 | 403 | `NOT_AUTHOR`, `NOT_ALLOWED` | edit/delete someone else's post or comment |
 | 400 | `DESCRIPTION_REQUIRED` | text-only post without a description |
 | 400 | `INVALID_IMAGE`, `INVALID_UPLOAD` / 413 `FILE_TOO_LARGE` | photo problems (max 6, 10 MB each) |
@@ -325,8 +365,8 @@ Base `/api/v1`. **Every route needs `Authorization: Bearer`.**
 | POST | `/notifications/read-all` | `{ before? }` (ISO time, optional) | Only up to `before` if given, so one arriving meanwhile stays unread |
 | DELETE | `/notifications/:id` | – | → `{ unreadCount }` |
 | POST | `/notifications/test` | – | Sends a `test` event to your connected devices → `{ devices }` |
-| GET | `/settings` | – | → `{ settings }`: the app's notification settings, defaults filled in |
-| PATCH | `/settings` | any of the keys below | Merged into what is stored; unknown keys/values → 400 |
+| GET | `/settings` | – | → `{ settings }`: all 45 keys of the app's settings, defaults filled in (see "Settings") |
+| PATCH | `/settings` | any subset of the keys | Merged into what is stored; unknown keys/values → 400 |
 
 Notification shape: `{ id, type, message, actor (user card or null), post: { id, title, thumbnailUrl } | null,
 comment: { id, text } | null, url, read, createdAt }`. `message` is ready to show ("Priya Sharma liked your
@@ -352,7 +392,8 @@ always shows everything (like Instagram). Keys (same as the app's `settingsSlice
 `notifFollowRequests`, `notifActivityApproved`, `notifActivityReminders`, `notifNearbyOpportunities`,
 `notifAnnouncements`, `emailWeeklyDigest`, `emailOpportunities`, `emailProductUpdates`, `notifSound`,
 `notifVibrate`, `quietHours` (22:00–07:00 in `DEFAULT_TIMEZONE`: banner on the `silent` channel). Mentions,
-reminders, nearby, announcements and the email keys are stored for later features.
+reminders, nearby, announcements and the email keys are stored for later features. The other settings
+(privacy, interactions, feed, media...) are in "Settings" below.
 
 ### The WebSocket: `ws://localhost:3000/api/v1/ws`
 
@@ -398,7 +439,7 @@ out from their posts on every request.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/v1/users/me/impact` | Yours, including `underReview` and `rejected` counts |
-| GET | `/api/v1/users/:user/impact` | Someone else's. Totals and medals are public (like follower counts); `byCategory` is `null` if their account is private and you don't follow it. 404 if they blocked you, 403 `USER_BLOCKED` if you blocked them |
+| GET | `/api/v1/users/:user/impact` | Someone else's. Totals and medals are public (like follower counts) unless they turned `showImpactStats` off (403 `IMPACT_HIDDEN`); `byCategory` is `null` if you can't see their activities (private and not following, or `whoCanViewActivities`). 404 if they blocked you, 403 `USER_BLOCKED` if you blocked them |
 
 ```json
 { "impact": {
@@ -452,7 +493,7 @@ reported.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/reports` | `type` (`post` \| `comment` \| `user`), `targetId` (an id, or a username for users), `reason`, `details?` (≤500) | 201, or 200 with `alreadyReported: true` if your report on it is still open. Only what you can see; never yourself |
+| POST | `/reports` | `type` (`post` \| `comment` \| `user` \| `story`), `targetId` (an id, or a username for users), `reason`, `details?` (≤500) | 201, or 200 with `alreadyReported: true` if your report on it is still open. Only what you can see; never yourself |
 | POST | `/reports/problem` | `category` (`bug` \| `content` \| `account` \| `idea`), `details` (15–1000), `deviceInfo?` | The app's "Report a problem" screen |
 
 Reasons: `spam, nudity, hate_speech, harassment, violence, self_harm, false_information, scam,
@@ -467,8 +508,10 @@ admin with `npm run user:role -- <username> ADMIN`; after that admins use the ro
 | GET | `/admin/posts` | `?status=under_review\|rejected\|approved` (default under_review), `cursor`, `limit` | staff | Oldest first, any privacy; each post has `openReports: { count, reasons }` |
 | POST | `/admin/posts/:postId/approve` | `note?` | staff | Dismisses its open reports; notifies the author if the status changed |
 | POST | `/admin/posts/:postId/reject` | `reason` (3–300) | staff | Resolves its open reports; the author sees `rejectionReason` |
+| POST / DELETE | `/admin/posts/:postId/feature` | – | staff | Staff pick for Explore's "Featured" view (approved posts only, else 409 `POST_NOT_APPROVED`); rejecting a post unfeatures it |
 | DELETE | `/admin/comments/:commentId` | `reason` | staff | Deletes it and its replies; the text is kept in the audit log |
-| GET | `/admin/reports` | `?status=open\|resolved\|dismissed` (default open), `type?`, `cursor`, `limit` | staff | Oldest first, with reporter, target and `openReportsOnTarget` |
+| DELETE | `/admin/stories/:storyId` | `reason` | staff | Deletes the story and its file, resolves its reports |
+| GET | `/admin/reports` | `?status=open\|resolved\|dismissed` (default open), `type?` (`post\|comment\|user\|story\|problem`), `cursor`, `limit` | staff | Oldest first, with reporter, target (post / comment / story) and `openReportsOnTarget` |
 | POST | `/admin/reports/:reportId/resolve` | `action` (`dismiss` \| `resolve` \| `remove` \| `suspend`), `note?` | staff (`suspend`: admin) | Closes every open report on the same target |
 | POST | `/admin/users/:userId/suspend` | `reason` | admin | Logs them out everywhere and closes their WebSockets now |
 | POST | `/admin/users/:userId/unsuspend` | `note?` | admin | |
@@ -483,6 +526,86 @@ admin with `npm run user:role -- <username> ADMIN`; after that admins use the ro
 | 403 | `TARGET_IS_ADMIN` | remove the admin role before suspending |
 | 409 | `REPORT_CLOSED`, `NOT_SUSPENDED`, `ACCOUNT_DELETING` | |
 | 404 | `REPORT_NOT_FOUND`, `POST_NOT_FOUND`, `COMMENT_NOT_FOUND`, `USER_NOT_FOUND` | |
+
+## Settings
+
+`GET /api/v1/settings` returns, and `PATCH /api/v1/settings` takes, the 45 keys of the app's
+`SETTINGS_DEFAULTS` (MyVolApp `src/data/appSettingsContent.js`). Choice keys accept only their options,
+every other key is a boolean; unknown keys → 400. Three keys are columns on `users` because list queries
+filter on them (`privateAccount` = `is_private`, `whoCanViewActivities` = `activity_visibility`,
+`showLocationOnPosts` = `show_location`); the rest are one JSONB object (`user_settings.data`).
+
+| Key | Options (default first) | What the server does with it |
+|---|---|---|
+| `pauseAll`, `notifLikes`, `notifComments`, `notifNewFollowers`, `notifFollowRequests`, `notifActivityApproved`, `notifSound`, `notifVibrate`, `quietHours` | see "Notifications" | The phone-banner rules (`alert`) |
+| `notifMentions`, `notifActivityReminders`, `notifNearbyOpportunities`, `notifAnnouncements`, `emailWeeklyDigest`, `emailOpportunities`, `emailProductUpdates` | – | Stored (no mentions, reminders, opportunities, announcements or digests yet) |
+| `privateAccount` | `false` / true | = the profile's `isPrivate` (followers need approval, content for followers only). Going public approves waiting requests |
+| `whoCanFollow` | `everyone` / `approve` / `none` | `approve`: a public account takes requests. `none`: 403 `FOLLOWS_PAUSED` for new followers, existing ones stay. Leaving `approve` approves waiting requests |
+| `whoCanViewActivities` | `everyone` / `followers` / `onlyMe` | Who sees the posts (grid, feeds, explore, search, hashtags, saved, reels). See "Posts" |
+| `showLocationOnPosts` | `true` / false | Off: `location` is null for others and city filters/search don't match it |
+| `showImpactStats` | `true` / false | Off: `profile.impact` null and `/users/:user/impact` 403 `IMPACT_HIDDEN` for others |
+| `suggestToOthers` | `true` / false | Off: never in anyone's "Suggested for you" |
+| `showActivityStatus` | `true` / false | Stored (no presence yet; it belongs with chat) |
+| `whoCanComment` | `everyone` / `followers` / `following` / `off` | Enforced on new comments and replies (403 `COMMENTS_OFF` / `COMMENTS_RESTRICTED`); posts carry `canComment` |
+| `hideOffensiveComments` | `true` / false | Hides offensive comments from everyone but their writer; the author sees them under `?hidden=true` |
+| `hideLikeCounts` | `false` / true | On: `likesCount` null for others |
+| `allowSharing` | `true` / false | Off: `POST /posts/:id/share` 403 `SHARING_DISABLED` for others; posts carry `canShare` |
+| `whoCanMention`, `whoCanTag`, `allowReposts` | `everyone`/`following`/`none`; `following`/`everyone`/`none`; `true` | Stored (no mentions, tags or reposts yet) |
+| `feedSort` | `recommended` / `latest` / `following` | The home feed's default (`?sort=` overrides) |
+| `showSuggestedVolunteers` | `true` / false | Off: `/users/me/suggestions` → `{ enabled: false, users: [] }` |
+| `nearbyRadius`, `sensitiveContent` | `'25'`/`'10'`/`'50'`/`'any'`; `standard`/`less` | Stored ("near you" is by city until there is geo data; posts have no sensitive flag yet) |
+| `autoplayVideos`, `startVideosMuted`, `dataSaver`, `uploadQuality`, `saveOriginalPhotos` | `wifi`/`always`/`never`; `true`; `false`; `high`/`standard`; `false` | App-side only (stored so they follow the account) |
+| `language`, `distanceUnit` | `en`/`hi`/`bn`/`mr`/`ta`/`te`/`gu`/`kn`/`pa`; `km`/`mi` | App-side only |
+| `reduceMotion`, `altTextReminders`, `captionsByDefault` | `false`; `true`; `false` | App-side only |
+| `loginAlerts` | `true` / false | Email on a sign-in from a new device (see "Data export & login alerts") |
+
+## Stories
+
+A story is one photo or video with an optional caption, gone `STORY_LIFETIME_HOURS` (24) after it was
+shared, like the app's `storiesSlice`. Not reviewed, liked or commented on; never in the feed or grid.
+Who sees it: the profile rule (public, or approved follower; nothing across a block). Base `/api/v1`, all
+routes need `Authorization: Bearer`.
+
+| Method | Path | Body / query | Notes |
+|---|---|---|---|
+| POST | `/stories` | multipart: one file in `media`, `caption?` (≤ 200) | Verified accounts only. Photo → WebP; video ≤ `STORY_MAX_VIDEO_SECONDS` (60) → MP4 + WebP cover. 30 an hour |
+| GET | `/stories/tray` | – | The Home rail: `{ tray: [{ user, storiesCount, hasUnseen, latestAt }] }`. You first, then people you follow (not muted) with unwatched stories, then the rest, most recent first |
+| GET | `/users/:user/stories` | – | `{ user, stories }`, oldest first (play order) |
+| GET | `/stories/:storyId` | – | One story (404 `STORY_NOT_FOUND` once expired) |
+| POST | `/stories/:storyId/view` | – | Mark seen. First time per viewer = +1 view; the author's own views don't count |
+| GET | `/stories/:storyId/viewers` | `?cursor&limit` | Author only (403 `NOT_AUTHOR`): `{ viewsCount, viewers, nextCursor }`, newest first |
+| DELETE | `/stories/:storyId` | – | Author only; the file goes too |
+
+Story shape: `{ id, author, type: 'image'|'video', url, thumbnailUrl, width, height, durationMs, caption,
+createdAt, expiresAt, seen, isMine, viewsCount (author only) }`. Profiles carry `stories: { count, hasUnseen }`
+for the avatar ring. Expired stories disappear from every read at once; the cleanup job (every 6 h) deletes
+them with their files. Reports: `POST /reports` with `type: 'story'`; staff remove with
+`DELETE /admin/stories/:storyId` or `resolve` → `remove`.
+
+## Suggested volunteers
+
+`GET /api/v1/users/me/suggestions?limit=10` (1–30): the Home "Suggested for you" rail →
+`{ enabled, users: [{ …user card, followersCount, reason: { type, text, mutualCount } }] }`.
+
+- Ranked: `follows_you` ("Follows you") → `mutual` ("Followed by Priya + 2 more": people you follow follow
+  them) → `same_city` ("Also in Mumbai", the profile cities) → `popular` ("Suggested for you", most followed).
+- Never suggested: you, people you follow or have requested, blocks either way, people you muted or
+  dismissed, people with `suggestToOthers` off or `whoCanFollow: none`, inactive accounts.
+- `POST /api/v1/users/me/suggestions/:userId/dismiss` (the card's ✕) hides someone for good.
+- Your own `showSuggestedVolunteers` off → `{ enabled: false, users: [] }`.
+
+## Data export & login alerts
+
+- `POST /api/v1/users/me/export` with `{ password }` ("Download your information"): the whole account as a
+  JSON file (`Content-Disposition: attachment`): account, profile, settings, posts with media URLs,
+  comments, likes, saves, followers, following, requests, blocks, mutes, stories, notifications, reports
+  made, active sessions and the last 500 login events. Never password/token/code hashes or who reported
+  you. Wrong or missing password → 403 `INVALID_PASSWORD` (Google-only accounts: a sign-in within 10 min,
+  else `REAUTH_REQUIRED`). 5 an hour. Audited as `data_exported`.
+- **Login alerts**: a sign-in (password, phone or Google) from a device the account hasn't used before (a
+  new `deviceName` + user agent pair, and not the account's first session) is audited as
+  `new_device_login` and, with `loginAlerts` on (default), emailed ("New sign-in to your MyVolApp
+  account", printed to the console locally). Phone-only accounts have no email to send it to.
 
 ## Prisma 7 notes
 

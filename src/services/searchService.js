@@ -1,5 +1,6 @@
 const prisma = require('../lib/prisma');
 const AppError = require('../utils/appError');
+const { decodeOffset, offsetPage: page } = require('../utils/cursor');
 const { CARD_SELECT, relationsFor, toCard } = require('./socialGraph');
 const posts = require('./postService');
 
@@ -12,25 +13,8 @@ const posts = require('./postService');
 // then popularity), so they page by offset; the cursor hides that. Posts are newest
 // first with the feeds' keyset cursor, through the same visibility rule as the feeds.
 
-const MAX_OFFSET = 500; // nobody pages that far in search; keeps queries bounded
-
-// Opaque offset cursor, like the keyset ones: "o:40" in base64url.
-const encodeOffset = (n) => Buffer.from(`o:${n}`).toString('base64url');
-const decodeOffset = (cursor) => {
-    if (!cursor) return 0;
-    const match = /^o:(\d{1,4})$/.exec(Buffer.from(cursor, 'base64url').toString());
-    const n = match ? Number(match[1]) : NaN;
-    if (!Number.isInteger(n) || n > MAX_OFFSET) throw new AppError('Invalid cursor', 400, undefined, 'INVALID_CURSOR');
-    return n;
-};
-
 // The user's text inside LIKE patterns: %, _ and \ match literally.
 const escapeLike = (s) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
-
-const page = (rows, offset, limit) => ({
-    items: rows.slice(0, limit),
-    nextCursor: rows.length > limit && offset + limit <= MAX_OFFSET ? encodeOffset(offset + limit) : null,
-});
 
 // People: active accounts with no block between them and the viewer (private accounts
 // are found too, as on Instagram; their content stays private). Matches username,

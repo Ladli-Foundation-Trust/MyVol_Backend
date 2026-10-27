@@ -30,8 +30,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const createReport = z
     .strictObject({
-        type: upper(['post', 'comment', 'user']),
-        // A post id, comment id, or (for users) an id or username.
+        type: upper(['post', 'comment', 'user', 'story']),
+        // A post, comment or story id, or (for users) an id or username.
         targetId: z.string().trim().min(1).max(64),
         reason: upper(REASONS),
         details: details(1, 500).optional(),
@@ -54,7 +54,7 @@ const postQueue = listQuery.extend({
 
 const reportQueue = listQuery.extend({
     status: upper(['open', 'resolved', 'dismissed']).default('OPEN'),
-    type: upper(['post', 'comment', 'user', 'problem']).optional(),
+    type: upper(['post', 'comment', 'user', 'story', 'problem']).optional(),
 });
 
 const reason = (max = 300) => details(3, max);
@@ -62,6 +62,7 @@ const reason = (max = 300) => details(3, max);
 const approvePost = z.strictObject({ note: reason().optional() }).default({});
 const rejectPost = z.strictObject({ reason: reason() });
 const removeComment = z.strictObject({ reason: reason() });
+const removeStory = z.strictObject({ reason: reason() });
 const suspendUser = z.strictObject({ reason: reason() });
 const unsuspendUser = z.strictObject({ note: reason().optional() }).default({});
 const setRole = z.strictObject({ role: upper(['user', 'reviewer', 'admin']) });
@@ -81,6 +82,7 @@ module.exports = {
     problemReport,
     postParams: id('postId'),
     commentParams: id('commentId'),
+    storyParams: id('storyId'),
     userParams: id('userId'),
     reportParams: id('reportId'),
     postQueue,
@@ -88,6 +90,7 @@ module.exports = {
     approvePost,
     rejectPost,
     removeComment,
+    removeStory,
     suspendUser,
     unsuspendUser,
     setRole,

@@ -34,6 +34,12 @@ module.exports = {
         text: `You can now sign in to ${APP_NAME} with Google.${footer}`,
     }),
 
+    // loginAlerts setting: a sign-in from a device this account hasn't used before.
+    newLogin: ({ deviceName, ip, at }) => ({
+        subject: `New sign-in to your ${APP_NAME} account`,
+        text: `Your ${APP_NAME} account was just signed in to from a new device.\n\nDevice: ${deviceName || 'Unknown device'}\nIP address: ${ip || 'unknown'}\nTime: ${at.toUTCString()}\n\nIf this was you, there's nothing to do. If not, change your password now and sign out of the other devices under Settings > Security.`,
+    }),
+
     deletionScheduled: (date) => ({
         subject: `Your ${APP_NAME} account will be deleted`,
         text: `Your account is scheduled for permanent deletion on ${date.toDateString()}. Log in before then to cancel.${footer}`,

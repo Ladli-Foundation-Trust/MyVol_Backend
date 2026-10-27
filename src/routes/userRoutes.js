@@ -28,12 +28,16 @@ router.delete('/me/follow-requests/:userId', validate({ params: schemas.requestP
 router.get('/me/blocked', list, users.listBlocked);
 router.get('/me/muted', list, users.listMuted);
 router.get('/me/impact', users.myImpact);
+router.get('/me/suggestions', validate({ query: schemas.suggestionsQuery }), users.suggestions);
+router.post('/me/suggestions/:userId/dismiss', limits.followLimiter, validate({ params: schemas.requestParams }), users.dismissSuggestion);
+router.post('/me/export', limits.exportLimiter, validate({ body: schemas.exportData }), users.exportData);
 
 // ---------- other users: :user is an id or a username ----------
 router.get('/:user', user, users.getProfile);
 router.get('/:user/followers', user, list, users.followers);
 router.get('/:user/following', user, list, users.following);
 router.get('/:user/posts', user, list, posts.userPosts);
+router.get('/:user/stories', user, users.stories);
 router.get('/:user/impact', user, users.impact);
 router.post('/:user/follow', limits.followLimiter, user, users.follow);
 router.delete('/:user/follow', limits.followLimiter, user, users.unfollow);

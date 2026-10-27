@@ -2,7 +2,8 @@ const prisma = require('../lib/prisma');
 const AppError = require('../utils/appError');
 const { MEDAL_TIERS } = require('../config/medals');
 const notifications = require('./notificationService');
-const { findActiveUser, relationsFor, canView } = require('./socialGraph');
+const { getSettings } = require('./settingsService');
+const { findActiveUser, relationsFor, canViewActivities } = require('./socialGraph');
 
 // A volunteer's impact: what their APPROVED activities add up to (posts under review
 // or rejected don't count), and the medal ladder on top of it. Computed from posts on
@@ -71,15 +72,19 @@ const getMyImpact = async (userId) => {
 };
 
 // Totals and medals are public, like follower counts (a private account's numbers
-// show on its profile header too). What the activities were about (byCategory) is
-// content, so it needs canView. Nothing across a block.
+// show on its profile header too), unless the owner turned showImpactStats off. What the
+// activities were about (byCategory) is content, so it needs canViewActivities. Nothing
+// across a block.
 const getImpact = async (viewerId, idOrUsername) => {
-    const user = await findActiveUser(idOrUsername, { viewerId, select: { id: true, isPrivate: true } });
+    const user = await findActiveUser(idOrUsername, { viewerId, select: { id: true, isPrivate: true, activityVisibility: true } });
     if (user.id === viewerId) return getMyImpact(viewerId);
     const relation = (await relationsFor(viewerId, [user.id]))(user.id);
     if (relation.blockedByMe) throw new AppError('Unblock this account to see it', 403, undefined, 'USER_BLOCKED');
+    if (!(await getSettings(user.id)).showImpactStats) {
+        throw new AppError('This volunteer keeps their impact stats private', 403, undefined, 'IMPACT_HIDDEN');
+    }
 
-    const visible = canView(viewerId, user, relation);
+    const visible = canViewActivities(viewerId, user, relation);
     const [sums, categories] = await Promise.all([totals(user.id), visible ? byCategory(user.id) : null]);
     return { impact: { ...sums, byCategory: categories, medals: medalsFor(sums.activities) } };
 };

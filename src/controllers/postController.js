@@ -23,6 +23,10 @@ exports.explore = async (req, res) => {
     ok(res, await posts.exploreFeed(req.user.id, { ...query, categories: category }));
 };
 
+exports.exploreStats = async (req, res) => ok(res, await posts.exploreStats());
+
+exports.trending = async (req, res) => ok(res, await posts.trendingPosts(req.user.id, req.validatedQuery));
+
 exports.reels = async (req, res) => ok(res, await posts.reelsFeed(req.user.id, req.validatedQuery));
 
 exports.view = async (req, res) => ok(res, await posts.recordView(req.user.id, req.params.postId, req.body));

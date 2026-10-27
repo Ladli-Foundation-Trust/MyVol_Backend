@@ -17,6 +17,7 @@
     "db:studio": "prisma studio",
     "db:seed": "prisma db seed",
     "db:seed:demo": "node scripts/seed-demo.js",
+    "db:seed:e2e": "node scripts/seed-e2e.js",
     "auth:cleanup": "node scripts/auth-cleanup.js",
     "db:clean-postman": "node scripts/clean-postman-data.js",
     "ws:listen": "node scripts/ws-listen.js",

@@ -5,9 +5,11 @@ const storage = require('../lib/storage');
 const AppError = require('../utils/appError');
 const audit = require('./auditService');
 const { toAvatar } = require('../lib/images');
-const { acceptAllRequests } = require('./followService');
+const { settlePendingRequests, requiresApproval } = require('./followService');
 const impact = require('./impactService');
-const { findActiveUser, relationsFor, canView } = require('./socialGraph');
+const { storySummary } = require('./storyService');
+const { getSettings } = require('./settingsService');
+const { findActiveUser, relationsFor, canView, canViewActivities } = require('./socialGraph');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -18,6 +20,7 @@ const PROFILE_SELECT = {
     bio: true,
     avatarKey: true,
     isPrivate: true,
+    activityVisibility: true,
     followersCount: true,
     followingCount: true,
     dateOfBirth: true,
@@ -61,6 +64,8 @@ const toProfile = (user, viewerId, relation, postsCount) => {
         followStatus: isMe ? null : followStatus,
         followsYou: isMe ? false : followsYou,
         canViewContent: visible,
+        // The posts grid: canViewContent plus the owner's whoCanViewActivities.
+        canViewActivities: canViewActivities(viewerId, user, relation),
         details: visible
             ? {
                   country: p.country ?? null,
@@ -89,17 +94,19 @@ const countPosts = (userId, isMe) => prisma.post.count({ where: { authorId: user
 // ---------- own profile ----------
 
 const getMe = async (userId) => {
-    const [user, pendingRequestsCount, postsCount, impactSummary] = await Promise.all([
+    const [user, pendingRequestsCount, postsCount, impactSummary, stories] = await Promise.all([
         prisma.user.findUnique({ where: { id: userId }, select: PROFILE_SELECT }),
         prisma.followRequest.count({ where: { targetId: userId, requester: { status: 'ACTIVE' } } }),
         countPosts(userId, true),
         impact.summaryFor(userId),
+        storySummary(userId, userId),
     ]);
     const nextChange = user.usernameChangedAt && new Date(user.usernameChangedAt.getTime() + env.USERNAME_CHANGE_COOLDOWN_DAYS * DAY_MS);
 
     return {
         ...toProfile(user, userId, SELF, postsCount),
         impact: impactSummary,
+        stories,
         showPersonalDetails: Boolean(user.profile?.showPersonalDetails),
         pendingRequestsCount,
         usernameChangeAvailableAt: nextChange && nextChange > new Date() ? nextChange : null,
@@ -107,10 +114,12 @@ const getMe = async (userId) => {
 };
 
 // One endpoint for the whole edit screen: send only the fields that changed.
-// Going from private to public approves every pending follow request.
+// Going from private to public approves every pending follow request, unless
+// whoCanFollow is 'approve' (the same rule as PATCH /settings privateAccount).
 const updateMe = async (userId, data) => {
     const userData = pick(data, ['name', 'bio', 'isPrivate', 'dateOfBirth']);
     const profileData = pick(data, PROFILE_FIELDS);
+    const { whoCanFollow } = await getSettings(userId);
 
     await prisma.$transaction(async (tx) => {
         const before = await tx.user.findUnique({ where: { id: userId }, select: { isPrivate: true } });
@@ -120,7 +129,12 @@ const updateMe = async (userId, data) => {
         if (Object.keys(profileData).length) {
             await tx.profile.upsert({ where: { userId }, create: { userId, ...profileData }, update: profileData });
         }
-        if (before.isPrivate && userData.isPrivate === false) await acceptAllRequests(tx, userId);
+        await settlePendingRequests(
+            tx,
+            userId,
+            { isPrivate: before.isPrivate, whoCanFollow },
+            { isPrivate: userData.isPrivate ?? before.isPrivate, whoCanFollow },
+        );
     });
 
     return getMe(userId);
@@ -181,17 +195,26 @@ const removeAvatar = async (userId) => {
 const getProfile = async (viewerId, idOrUsername) => {
     const user = await findActiveUser(idOrUsername, { viewerId, select: PROFILE_SELECT });
     if (user.id === viewerId) return getMe(viewerId);
-    const [rel, postsCount, muted, impactSummary] = await Promise.all([
+    const [rel, postsCount, muted, impactSummary, prefs, stories] = await Promise.all([
         relationsFor(viewerId, [user.id]),
         countPosts(user.id, false),
         prisma.mute.count({ where: { muterId: viewerId, mutedId: user.id } }),
         impact.summaryFor(user.id),
+        getSettings(user.id),
+        storySummary(viewerId, user.id),
     ]);
     const relation = rel(user.id);
+    const profile = toProfile(user, viewerId, relation, relation.blockedByMe ? 0 : postsCount);
     return {
-        ...toProfile(user, viewerId, relation, relation.blockedByMe ? 0 : postsCount),
-        // Public totals, like the follower counts (impactService); none across a block.
-        impact: relation.blockedByMe ? null : impactSummary,
+        ...profile,
+        // Public totals, like the follower counts (impactService), unless the owner turned
+        // showImpactStats off; none across a block.
+        impact: relation.blockedByMe || !prefs.showImpactStats ? null : impactSummary,
+        // The follow button: "Request" when approval is needed, disabled when paused.
+        followRequiresApproval: requiresApproval({ isPrivate: user.isPrivate, whoCanFollow: prefs.whoCanFollow }),
+        followsPaused: prefs.whoCanFollow === 'none',
+        // The story ring, when the profile is visible.
+        stories: profile.canViewContent ? stories : { count: 0, hasUnseen: false },
         blockedByMe: relation.blockedByMe,
         mutedByMe: muted > 0,
     };

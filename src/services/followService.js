@@ -2,7 +2,14 @@ const prisma = require('../lib/prisma');
 const AppError = require('../utils/appError');
 const { afterCursor, toPage } = require('../utils/cursor');
 const notifications = require('./notificationService');
+const { getSettings } = require('./settingsService');
 const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, isBlockedBetween, toCard } = require('./socialGraph');
+
+// ---------- follow policy (privateAccount + whoCanFollow) ----------
+
+// New followers need approval when the account is private, or public with
+// whoCanFollow = 'approve' (the app's "Approve requests"). 'none' pauses new followers.
+const requiresApproval = ({ isPrivate, whoCanFollow }) => isPrivate || whoCanFollow === 'approve';
 
 // ---------- the only code that writes follows (keeps the counters right) ----------
 
@@ -22,7 +29,8 @@ const removeFollow = async (tx, followerId, followingId) => {
     await tx.user.update({ where: { id: followingId }, data: { followersCount: { decrement: 1 } }, select: { id: true } });
 };
 
-// Used when an account goes from private to public: everyone waiting gets in.
+// Used when an account stops needing approval (private -> public, or whoCanFollow
+// 'approve' -> 'everyone'/'none'): everyone waiting gets in.
 const acceptAllRequests = async (tx, userId) => {
     const requests = await tx.followRequest.findMany({ where: { targetId: userId }, select: { requesterId: true } });
     for (const { requesterId } of requests) await addFollow(tx, requesterId, userId);
@@ -30,22 +38,33 @@ const acceptAllRequests = async (tx, userId) => {
     await notifications.allRequestsAccepted(tx, userId);
 };
 
+// Call in the transaction that changed isPrivate / whoCanFollow, with the policy before
+// and after ({ isPrivate, whoCanFollow }).
+const settlePendingRequests = async (tx, userId, before, after) => {
+    if (requiresApproval(before) && !requiresApproval(after)) await acceptAllRequests(tx, userId);
+};
+
 // ---------- actions ----------
 
-// Public account: follows at once. Private account: leaves a request. Repeating
-// the call is harmless and returns the current state.
+// Public account: follows at once. Private account (or whoCanFollow 'approve'): leaves
+// a request. whoCanFollow 'none': refused, existing followers stay. Repeating the call
+// is harmless and returns the current state.
 const follow = async (viewerId, idOrUsername) => {
     const target = await findActiveUser(idOrUsername, { viewerId }); // 404 if they blocked you
     if (target.id === viewerId) throw new AppError("You can't follow yourself", 400, undefined, 'CANNOT_FOLLOW_SELF');
     if (await isBlockedBetween(viewerId, target.id)) {
         throw new AppError('Unblock this account to follow it', 403, undefined, 'USER_BLOCKED');
     }
+    const { whoCanFollow } = await getSettings(target.id);
 
     const { followStatus, notificationId } = await prisma.$transaction(async (tx) => {
         const pair = { followerId_followingId: { followerId: viewerId, followingId: target.id } };
         if (await tx.follow.findUnique({ where: pair, select: { createdAt: true } })) return { followStatus: 'following' };
+        if (whoCanFollow === 'none') {
+            throw new AppError('This account is not accepting new followers', 403, undefined, 'FOLLOWS_PAUSED');
+        }
 
-        if (target.isPrivate) {
+        if (requiresApproval({ isPrivate: target.isPrivate, whoCanFollow })) {
             await tx.followRequest.createMany({ data: [{ requesterId: viewerId, targetId: target.id }], skipDuplicates: true });
             return { followStatus: 'requested', notificationId: await notifications.followRequested(tx, viewerId, target.id) };
         }
@@ -138,8 +157,10 @@ const listRequests = async (viewerId, { cursor, limit }) => {
 };
 
 module.exports = {
+    requiresApproval,
     removeFollow,
     acceptAllRequests,
+    settlePendingRequests,
     follow,
     unfollow,
     removeFollower,

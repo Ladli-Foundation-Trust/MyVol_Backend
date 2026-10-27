@@ -28,7 +28,7 @@ module.exports = (err, req, res, next) => {
             err.code === 'LIMIT_FILE_SIZE'
                 ? new AppError('That file is too large', 413, undefined, 'FILE_TOO_LARGE')
                 : ['LIMIT_FILE_COUNT', 'LIMIT_UNEXPECTED_FILE'].includes(err.code)
-                  ? new AppError('Too many files, or a file in the wrong field (use "media", at most 6)', 400, undefined, 'INVALID_UPLOAD')
+                  ? new AppError('Too many files, or a file in the wrong field (use "media": at most 6 per post, 1 per story)', 400, undefined, 'INVALID_UPLOAD')
                   : new AppError(`Upload rejected: ${err.message}`, 400, undefined, 'INVALID_UPLOAD');
     }
     if (err.name === 'JsonWebTokenError' || err.name === 'NotBeforeError') {

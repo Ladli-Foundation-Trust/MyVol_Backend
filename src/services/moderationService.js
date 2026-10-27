@@ -8,6 +8,7 @@ const notifications = require('./notificationService');
 const impact = require('./impactService');
 const { POST_INCLUDE, toPosts } = require('./postService');
 const { findComment, removeComment: deleteCommentAndReplies } = require('./commentService');
+const { removeStory: deleteStory } = require('./storyService');
 const { CARD_SELECT, relationsFor, toCard } = require('./socialGraph');
 
 // Staff tools (role REVIEWER or ADMIN; suspensions and roles are ADMIN only, see
@@ -72,7 +73,12 @@ const reviewPost = async (moderatorId, postId, status, reason) => {
     const newlyApproved = status === 'APPROVED' && post.status !== 'APPROVED';
 
     const notificationIds = await prisma.$transaction(async (tx) => {
-        await tx.post.update({ where: { id: postId }, data: { status, rejectionReason }, select: { id: true } });
+        // A rejected post also stops being a staff pick.
+        await tx.post.update({
+            where: { id: postId },
+            data: { status, rejectionReason, ...(status === 'REJECTED' && { featuredAt: null }) },
+            select: { id: true },
+        });
         await log(tx, moderatorId, status === 'APPROVED' ? 'APPROVE_POST' : 'REJECT_POST', 'post', postId, reason);
         // Approving clears the reports (no violation); rejecting resolves them.
         await closeReports(
@@ -93,6 +99,35 @@ const reviewPost = async (moderatorId, postId, status, reason) => {
 
 const approvePost = (moderatorId, postId, { note } = {}) => reviewPost(moderatorId, postId, 'APPROVED', note);
 const rejectPost = (moderatorId, postId, { reason }) => reviewPost(moderatorId, postId, 'REJECTED', reason);
+
+// Staff picks for Explore's "Featured" view. Only approved posts; featuring again keeps
+// the original date. Rejecting a post unfeatures it (reviewPost).
+const setFeatured = async (moderatorId, postId, featured) => {
+    const post = await prisma.post.findUnique({ where: { id: postId }, select: { id: true, status: true, featuredAt: true } });
+    if (!post) throw notFound('Post');
+    if (featured && post.status !== 'APPROVED') {
+        throw new AppError('Only approved posts can be featured', 409, undefined, 'POST_NOT_APPROVED');
+    }
+    const featuredAt = featured ? (post.featuredAt ?? new Date()) : null;
+    await prisma.$transaction(async (tx) => {
+        await tx.post.update({ where: { id: postId }, data: { featuredAt }, select: { id: true } });
+        if (Boolean(post.featuredAt) !== featured) await log(tx, moderatorId, featured ? 'FEATURE_POST' : 'UNFEATURE_POST', 'post', postId, null);
+    });
+    return { post: { id: postId, featured, featuredAt } };
+};
+
+// ---------- stories ----------
+
+// Removes a reported story (its file too) and closes the reports about it.
+const removeStory = async (moderatorId, storyId, { reason }) => {
+    const story = await prisma.story.findUnique({ where: { id: storyId } });
+    if (!story) throw notFound('Story');
+    await prisma.$transaction(async (tx) => {
+        await log(tx, moderatorId, 'DELETE_STORY', 'story', storyId, reason, { authorId: story.authorId, caption: story.caption });
+        await closeReports(tx, moderatorId, { storyId }, 'RESOLVED', `story removed: ${reason}`);
+    });
+    await deleteStory(story);
+};
 
 // ---------- comments ----------
 
@@ -169,6 +204,7 @@ const REPORT_INCLUDE = {
         },
     },
     comment: { select: { id: true, text: true, postId: true } },
+    story: { select: { id: true, type: true, key: true, thumbnailKey: true, caption: true, expiresAt: true } },
     resolvedBy: { select: CARD_SELECT },
 };
 
@@ -176,6 +212,7 @@ const REPORT_INCLUDE = {
 const sameTarget = (report) => {
     if (report.type === 'POST' && report.postId) return { type: 'POST', postId: report.postId };
     if (report.type === 'COMMENT' && report.commentId) return { type: 'COMMENT', commentId: report.commentId };
+    if (report.type === 'STORY' && report.storyId) return { type: 'STORY', storyId: report.storyId };
     if (report.type === 'USER' && report.userId) return { type: 'USER', userId: report.userId };
     return { id: report.id }; // problem reports, or content that's gone
 };
@@ -211,6 +248,16 @@ const listReports = async (moderatorId, { status, type, cursor, limit }) => {
             user: r.user ? { ...toCard(r.user, moderatorId, rel), status: r.user.status } : null,
             post: r.post ? { id: r.post.id, title: r.post.title, status: r.post.status, thumbnailUrl: thumb(r.post) } : null,
             comment: r.comment,
+            story: r.story
+                ? {
+                      id: r.story.id,
+                      type: r.story.type.toLowerCase(),
+                      url: storage.urlFor(r.story.key),
+                      thumbnailUrl: storage.urlFor(r.story.thumbnailKey ?? r.story.key),
+                      caption: r.story.caption,
+                      expiresAt: r.story.expiresAt,
+                  }
+                : null,
             openReportsOnTarget: openCounts[i],
             resolution: r.resolution,
             resolvedBy: r.resolvedBy ? toCard(r.resolvedBy, moderatorId, rel) : null,
@@ -224,7 +271,7 @@ const listReports = async (moderatorId, { status, type, cursor, limit }) => {
 // Closes a report (and every other open report about the same thing) with an action:
 //   dismiss  no violation                      → DISMISSED
 //   resolve  handled, nothing to remove        → RESOLVED (e.g. a problem report)
-//   remove   reject the post / delete comment  → RESOLVED
+//   remove   reject the post / delete comment or story → RESOLVED
 //   suspend  suspend the user / the author     → RESOLVED (ADMIN only)
 const resolveReport = async (moderator, reportId, { action, note }) => {
     const report = await prisma.report.findUnique({ where: { id: reportId } });
@@ -236,6 +283,7 @@ const resolveReport = async (moderator, reportId, { action, note }) => {
     if (action === 'remove') {
         if (report.type === 'POST' && report.postId) await rejectPost(moderator.id, report.postId, { reason: reasonText });
         else if (report.type === 'COMMENT' && report.commentId) await removeComment(moderator.id, report.commentId, { reason: reasonText });
+        else if (report.type === 'STORY' && report.storyId) await removeStory(moderator.id, report.storyId, { reason: reasonText });
         else throw new AppError('Nothing to remove for this report', 400, undefined, 'NOTHING_TO_REMOVE');
     }
     if (action === 'suspend') {
@@ -284,7 +332,9 @@ module.exports = {
     listPosts,
     approvePost,
     rejectPost,
+    setFeatured,
     removeComment,
+    removeStory,
     suspendUser,
     unsuspendUser,
     setRole,

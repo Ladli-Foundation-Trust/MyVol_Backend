@@ -1,5 +1,6 @@
 const notifications = require('../services/notificationService');
 const settings = require('../services/settingsService');
+const accountSettings = require('../services/accountSettingsService');
 
 const ok = (res, data) => res.json({ status: 'success', data });
 
@@ -22,4 +23,4 @@ exports.test = async (req, res) => ok(res, notifications.sendTest(req.user.id));
 
 exports.getSettings = async (req, res) => ok(res, { settings: await settings.getSettings(req.user.id) });
 
-exports.updateSettings = async (req, res) => ok(res, { settings: await settings.updateSettings(req.user.id, req.body) });
+exports.updateSettings = async (req, res) => ok(res, { settings: await accountSettings.updateSettings(req.user.id, req.body) });

@@ -24,6 +24,14 @@ newman/
 logs/
 npm-debug.log*
 
+# Tests: suites, e2e seed data and the testing guide stay local
+test/
+tests/
+*.test.js
+*.spec.js
+TESTING.md
+scripts/seed-e2e.js
+
 # Test coverage
 coverage/
 .nyc_output/

@@ -7,7 +7,8 @@ const REVOKED_SESSION_RETENTION_DAYS = 30;
 const USED_REFRESH_TOKEN_RETENTION_DAYS = 7;
 const AUTH_EVENT_RETENTION_DAYS = 180;
 
-// Deletes dead auth rows and purges accounts whose deletion grace period is over.
+// Deletes dead auth rows, expired stories and old notifications, and purges accounts
+// whose deletion grace period is over.
 // Runs in one transaction behind a Postgres advisory lock, so if several API
 // instances fire it at once only one does the work.
 const purgeDatabase = () =>
@@ -22,16 +23,22 @@ const purgeDatabase = () =>
             const purging = { status: 'PENDING_DELETION', deletionScheduledAt: { lte: now } };
             const avatars = await tx.user.findMany({ where: { ...purging, avatarKey: { not: null } }, select: { avatarKey: true } });
             const postMedia = await tx.postMedia.findMany({ where: { post: { author: purging } }, select: { key: true, thumbnailKey: true } });
+            // Stories of purged users, and every story past its 24 hours.
+            const storyWhere = { OR: [{ author: purging }, { expiresAt: { lte: now } }] };
+            const storyFiles = await tx.story.findMany({ where: storyWhere, select: { key: true, thumbnailKey: true } });
+            const stories = await tx.story.deleteMany({ where: storyWhere });
 
             // Other people's posts/comments the purged users liked, saved or commented
             // on: their counters are recounted after the cascade below.
-            const [liked, saved, viewed, commented, likedComments] = await Promise.all([
+            const [liked, saved, viewed, commented, likedComments, storyViews] = await Promise.all([
                 tx.postLike.findMany({ where: { user: purging }, select: { postId: true } }),
                 tx.postSave.findMany({ where: { user: purging }, select: { postId: true } }),
                 tx.postView.findMany({ where: { user: purging }, select: { postId: true } }),
                 tx.comment.findMany({ where: { author: purging }, select: { postId: true, parentId: true } }),
                 tx.commentLike.findMany({ where: { user: purging }, select: { commentId: true } }),
+                tx.storyView.findMany({ where: { viewer: purging }, select: { storyId: true } }),
             ]);
+            const viewedStoryIds = [...new Set(storyViews.map((v) => v.storyId))];
             const postIds = [...new Set([...liked, ...saved, ...viewed, ...commented].map((r) => r.postId))];
             const commentIds = [...new Set([...likedComments.map((r) => r.commentId), ...commented.map((r) => r.parentId).filter(Boolean)])];
 
@@ -63,6 +70,11 @@ const purgeDatabase = () =>
                         views_count = (SELECT count(*) FROM post_views v WHERE v.post_id = p.id),
                         comments_count = (SELECT count(*) FROM comments c WHERE c.post_id = p.id)
                     WHERE p.id = ANY(${postIds}::uuid[])`;
+            }
+            if (viewedStoryIds.length) {
+                await tx.$executeRaw`
+                    UPDATE stories s SET views_count = (SELECT count(*) FROM story_views v WHERE v.story_id = s.id)
+                    WHERE s.id = ANY(${viewedStoryIds}::uuid[])`;
             }
             if (commentIds.length) {
                 await tx.$executeRaw`
@@ -106,7 +118,11 @@ const purgeDatabase = () =>
                 events: events.count,
                 notifications: notifications.count,
                 hashtags: hashtags.count,
-                fileKeys: [...avatars.map((a) => a.avatarKey), ...postMedia.flatMap((m) => [m.key, m.thumbnailKey].filter(Boolean))],
+                stories: stories.count,
+                fileKeys: [
+                    ...avatars.map((a) => a.avatarKey),
+                    ...[...postMedia, ...storyFiles].flatMap((m) => [m.key, m.thumbnailKey].filter(Boolean)),
+                ],
             };
         },
         { timeout: 120_000 },

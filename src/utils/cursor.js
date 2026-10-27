@@ -34,4 +34,26 @@ const toPage = (rows, limit, idField) => {
     return { items, nextCursor: rows.length > limit ? encodeCursor(last.createdAt, last[idField]) : null };
 };
 
-module.exports = { afterCursor, toPage };
+// ---------- offset cursors (ranked lists: search, trending) ----------
+
+// Ranked lists can't use keyset paging (the order isn't by createdAt), so they page by
+// offset behind the same kind of opaque cursor: "o:40" in base64url.
+const MAX_OFFSET = 500; // nobody pages that far; keeps queries bounded
+
+const encodeOffset = (n) => Buffer.from(`o:${n}`).toString('base64url');
+
+const decodeOffset = (cursor) => {
+    if (!cursor) return 0;
+    const match = /^o:(\d{1,4})$/.exec(Buffer.from(cursor, 'base64url').toString());
+    const n = match ? Number(match[1]) : NaN;
+    if (!Number.isInteger(n) || n > MAX_OFFSET) throw new AppError('Invalid cursor', 400, undefined, 'INVALID_CURSOR');
+    return n;
+};
+
+// `rows` fetched with take: limit + 1 starting at `offset`.
+const offsetPage = (rows, offset, limit) => ({
+    items: rows.slice(0, limit),
+    nextCursor: rows.length > limit && offset + limit <= MAX_OFFSET ? encodeOffset(offset + limit) : null,
+});
+
+module.exports = { afterCursor, toPage, MAX_OFFSET, decodeOffset, offsetPage };

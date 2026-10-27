@@ -15,6 +15,20 @@ const CATEGORIES = [
     'Environment',
 ];
 
+// The profile's preferredAreas (userValidators.PREFERRED_AREAS) as post categories, for
+// the "recommended" home feed (postService.homeFeed).
+const AREA_CATEGORIES = {
+    'Environmental Conservation': ['Environment'],
+    Education: ['Education', 'Child Rights'],
+    Healthcare: ['Health', 'Drug Prevention'],
+    'Animal Welfare': ['Animal Welfare'],
+    'Community Development': ['Hunger & Poverty', 'Gender Equality', 'Youth & Sports'],
+    'Disaster Relief': ['Hunger & Poverty', 'Health'],
+};
+
+const FEED_SORTS = ['recommended', 'latest', 'following'];
+const EXPLORE_VIEWS = ['all', 'near', 'featured', 'videos'];
+
 const clearableText = (max) =>
     z
         .string()
@@ -64,7 +78,8 @@ const addComment = z.strictObject({
     parentId: z.uuid('is not a valid comment id').optional(),
 });
 
-// ?category=Health,Education&city=Mumbai
+// ?category=Health,Education&city=Mumbai&view=all|near|featured|videos (the app's quick
+// filters: All / Near You / Featured / Videos).
 const exploreQuery = listQuery.extend({
     category: z
         .string()
@@ -72,6 +87,36 @@ const exploreQuery = listQuery.extend({
         .transform((v) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : undefined))
         .pipe(z.array(z.enum(CATEGORIES, { error: `must be one of: ${CATEGORIES.join(', ')}` })).optional()),
     city: z.string().trim().min(1).max(60).optional(),
+    view: z.enum(EXPLORE_VIEWS, { error: `must be one of: ${EXPLORE_VIEWS.join(', ')}` }).default('all'),
 });
 
-module.exports = { CATEGORIES, createPost, updatePost, postParams, commentParams, addComment, exploreQuery, recordView };
+// ?sort= overrides the feedSort setting for one request.
+const feedQuery = listQuery.extend({
+    sort: z.enum(FEED_SORTS, { error: `must be one of: ${FEED_SORTS.join(', ')}` }).optional(),
+});
+
+// Trending: the most engaged public activities of the last `days` days.
+const trendingQuery = listQuery.extend({
+    days: z.coerce.number().int().min(1).max(30).default(7),
+    limit: z.coerce.number().int().min(1).max(50).default(10),
+});
+
+// ?hidden=true: the post author's "Hidden comments" list (hideOffensiveComments).
+const commentListQuery = listQuery.extend({
+    hidden: z.stringbool({ error: 'must be true or false' }).default(false),
+});
+
+module.exports = {
+    CATEGORIES,
+    AREA_CATEGORIES,
+    createPost,
+    updatePost,
+    postParams,
+    commentParams,
+    addComment,
+    exploreQuery,
+    feedQuery,
+    trendingQuery,
+    commentListQuery,
+    recordView,
+};

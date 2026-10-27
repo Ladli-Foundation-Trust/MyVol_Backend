@@ -4,6 +4,7 @@ const AppError = require('../utils/appError');
 const { findActiveUser } = require('./socialGraph');
 const { findVisiblePost } = require('./postService');
 const { findComment } = require('./commentService');
+const { findVisibleStory } = require('./storyService');
 
 // Reports from users. Anonymous: the reported person is never told who reported them
 // (the moderators see it). You can report only what you can see, never yourself, and
@@ -26,6 +27,11 @@ const resolveTarget = async (viewerId, type, targetId) => {
         await findVisiblePost(viewerId, comment.postId);
         if (comment.authorId === viewerId) throw cannotReportSelf();
         return { commentId: comment.id, userId: comment.authorId };
+    }
+    if (type === 'STORY') {
+        const story = await findVisibleStory(viewerId, targetId);
+        if (story.authorId === viewerId) throw cannotReportSelf();
+        return { storyId: story.id, userId: story.authorId };
     }
     const user = await findActiveUser(targetId, { viewerId });
     if (user.id === viewerId) throw cannotReportSelf();
@@ -56,7 +62,7 @@ const maybeAutoHide = async (tx, postId) => {
     }
 };
 
-// POST /reports { type: 'post' | 'comment' | 'user', targetId, reason, details? }
+// POST /reports { type: 'post' | 'comment' | 'user' | 'story', targetId, reason, details? }
 const createReport = async (viewerId, { type, targetId, reason, details }) => {
     const target = await resolveTarget(viewerId, type, targetId);
     const sameTarget = {
@@ -65,6 +71,7 @@ const createReport = async (viewerId, { type, targetId, reason, details }) => {
         status: 'OPEN',
         ...(type === 'POST' && { postId: target.postId }),
         ...(type === 'COMMENT' && { commentId: target.commentId }),
+        ...(type === 'STORY' && { storyId: target.storyId }),
         ...(type === 'USER' && { userId: target.userId }),
     };
 

@@ -6,6 +6,7 @@ const emails = require('../emails/authEmails');
 const audit = require('./auditService');
 const sessions = require('./sessionService');
 const codes = require('./verificationCodeService');
+const { getSettings } = require('./settingsService');
 const { queueMail } = require('../lib/mailer');
 const { assertReauthenticated } = require('./reauthService');
 const { usernameCandidates, isReserved } = require('../utils/username');
@@ -72,8 +73,10 @@ const recordFailedLogin = async (userId, ctx) => {
     audit.record(EVENTS.ACCOUNT_LOCKED, { userId, ctx, metadata: { minutes } });
 };
 
-// Shared tail of every successful sign-in (password or Google). Logging in also
+// Shared tail of every successful sign-in (password, phone or Google). Logging in also
 // cancels a deactivation or a pending deletion, which is what the app promises users.
+// A sign-in from a device the account hasn't used before is audited and, with the
+// loginAlerts setting on (the default), emailed to the account.
 const completeLogin = async (user, ctx, method, extra = {}) => {
     if (user.status === 'SUSPENDED') {
         audit.record(EVENTS.LOGIN_BLOCKED, { userId: user.id, ctx, metadata: { method } });
@@ -81,7 +84,13 @@ const completeLogin = async (user, ctx, method, extra = {}) => {
     }
     const reactivated = user.status !== 'ACTIVE';
 
-    const { updated, tokens } = await prisma.$transaction(async (tx) => {
+    const { updated, tokens, newDevice } = await prisma.$transaction(async (tx) => {
+        // A device = the app's deviceName + user agent. "New" only if the account has
+        // signed in before, so the first login after signing up on a phone is quiet.
+        const device = { deviceName: ctx.deviceName ?? null, userAgent: ctx.userAgent?.slice(0, 512) ?? null };
+        // One at a time: a transaction is one connection.
+        const seen = await tx.session.count({ where: { userId: user.id, ...device } });
+        const earlier = await tx.session.count({ where: { userId: user.id } });
         const updated = await tx.user.update({
             where: { id: user.id },
             data: {
@@ -94,11 +103,17 @@ const completeLogin = async (user, ctx, method, extra = {}) => {
             },
             ...WITH_PASSWORD,
         });
-        return { updated, tokens: await sessions.createSession(updated, ctx, tx) };
+        return { updated, tokens: await sessions.createSession(updated, ctx, tx), newDevice: earlier > 0 && seen === 0 };
     });
 
-    audit.record(EVENTS.LOGIN, { userId: user.id, ctx, metadata: { method } });
+    audit.record(EVENTS.LOGIN, { userId: user.id, ctx, metadata: { method, newDevice } });
     if (reactivated) audit.record(EVENTS.ACCOUNT_REACTIVATED, { userId: user.id, ctx, metadata: { from: user.status } });
+    if (newDevice) {
+        audit.record(EVENTS.NEW_DEVICE_LOGIN, { userId: user.id, ctx, metadata: { method } });
+        if ((await getSettings(user.id)).loginAlerts) {
+            queueMail({ to: updated.email, ...emails.newLogin({ deviceName: ctx.deviceName, ip: ctx.ip, at: new Date() }) });
+        }
+    }
 
     return { user: toPublicUser(updated), ...tokens, reactivated, ...extra };
 };

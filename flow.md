@@ -373,6 +373,102 @@ approval paths, inside their own transaction:
   → deliver() after commit (banner setting notifActivityApproved; url myvolapp://user/<me>)
 ```
 
+## 4h. Settings and the rules they drive (`/api/v1/settings`)
+
+```
+GET   /settings → settingsService.getSettings(userId)
+        one query: users.{is_private, activity_visibility, show_location} + user_settings.data
+        → DEFAULTS (45 app keys) ← stored JSON keys ← the 3 column keys
+PATCH /settings → validate(settingsValidators.updateSettings: built from DEFAULTS + OPTIONS)
+      → accountSettingsService.updateSettings
+        [tx] policy before {isPrivate, whoCanFollow}
+             splitChanges → users columns update + writeJson (jsonb ||, atomic merge)
+             followService.settlePendingRequests(before, after)
+               approval needed before and not after → acceptAllRequests (follows + counters,
+               FOLLOW_REQUEST notifications become FOLLOW)
+PATCH /users/me {isPrivate} → profileService.updateMe → the same settlePendingRequests
+
+Where each enforced key is read:
+  whoCanFollow          followService.follow           none → 403 FOLLOWS_PAUSED; approve → request
+  whoCanViewActivities  socialGraph.canViewActivities  + postService.visibleTo / findVisiblePost / userPosts
+                        (users.activity_visibility in SQL: feeds, explore, search, hashtags, saved, reels)
+  showLocationOnPosts   postService.toPosts (location null) + locationContains (city filters, search)
+  hideLikeCounts        postService.toPosts            likesCount null, likesHidden
+  allowSharing          postService.toPosts (canShare) + sharePost (403 SHARING_DISABLED)
+  whoCanComment         postService.commentAllowed     toPosts (canComment) + commentService.addComment
+  hideOffensiveComments commentService                 list filters + ?hidden=true + no notifications
+  showImpactStats       profileService.getProfile (impact null) + impactService.getImpact (403)
+  suggestToOthers, showSuggestedVolunteers             suggestionService
+  feedSort              postService.homeFeed
+  loginAlerts           authService.completeLogin
+  notification keys     notificationService.alertFor   (banner only, 4e)
+toPosts reads the authors' settings for a whole page with settingsService.settingsFor(ids): one query.
+```
+
+## 4i. Stories (`/api/v1/stories`, `/users/:user/stories`)
+
+```
+POST /stories → protect → requireVerified → storyLimiter → storyUpload (multer single 'media', OS temp)
+            → requireMedia → validate(createStory) → storyService.createStory
+              video → lib/videos.processVideo(path, { maxSeconds: STORY_MAX_VIDEO_SECONDS }) → mp4 + webp
+              photo → lib/images.toPostImage → webp
+              storage.save('stories/<id>.*') → stories row (expires_at = now + STORY_LIFETIME_HOURS)
+              any failure → saved files removed; temp file removed when the response closes
+GET  /stories/tray         stories (live, author ACTIVE, author = me OR followed by me and not muted)
+                           + story_views of mine → group by author → me first, unseen first, newest
+GET  /users/:user/stories  findActiveUser (404 if they blocked me) → canView (403) → live, oldest first
+GET  /stories/:id          findVisibleStory: live (else 404) → author ACTIVE → no block (404) → canView (403)
+POST /stories/:id/view     findVisibleStory → [tx] story_views createMany skipDuplicates
+                           → count 1 → stories.views_count + 1 (never for the author)
+GET  /stories/:id/viewers  author only → story_views (viewer ACTIVE, notBlockedWith) newest first
+DELETE /stories/:id        author only → removeStory: delete row (views cascade, reports SET NULL) → files
+Reports: reportService type STORY → findVisibleStory; moderationService.removeStory (resolve "remove" or
+  DELETE /admin/stories/:id) logs DELETE_STORY, resolves its reports, removeStory.
+Expiry: every read filters expires_at > now; jobs/authCleanup deletes expired rows + files.
+profileService: profile.stories = storySummary (count, hasUnseen) when the profile is visible.
+```
+
+## 4j. Discovery: feed sort, explore views, trending, stats, featured, suggestions
+
+```
+GET /posts/feed?sort        homeFeed: sort ?? settings.feedSort
+                              latest      OR [own, fromFollowing]
+                              following   fromFollowing (approved, followed, not muted, not onlyMe)
+                              recommended OR [own, fromFollowing, interestsOf]
+                                          interestsOf = publicActivities AND (category IN causes of
+                                          profile.preferredAreas (AREA_CATEGORIES) OR location ~ profile.city)
+                            → pageOfPosts (keyset, newest first) → { sort, posts, nextCursor }
+GET /posts/explore?view     publicActivities (APPROVED, author ACTIVE, public, activities 'everyone',
+                            not blocked, not muted) AND category AND city AND
+                              near → profile.city (400 CITY_REQUIRED) | featured → featured_at NOT NULL
+                              | videos → media some VIDEO
+GET /posts/trending?days    ≤ 1000 newest publicActivities of the period → score in JS → sort →
+                            offset page (utils/cursor offsetPage) → load posts → toPosts
+GET /posts/explore/stats    raw SQL totals over approved posts of active users + groupBy(category)
+POST|DELETE /admin/posts/:id/feature   moderationService.setFeatured (APPROVED only, 409) → featured_at
+                            + moderation_actions FEATURE_POST / UNFEATURE_POST; reject clears featured_at
+GET /users/me/suggestions   suggestionService.listSuggestions: settings.showSuggestedVolunteers off →
+                            { enabled: false } ; else one ranked SQL query (exclusions: me, followed,
+                            requested, blocks both ways, muted, dismissed, suggestToOthers false,
+                            whoCanFollow none) ORDER BY followsYou, mutual, sameCity (COALESCE false),
+                            followers_count, created_at → cards + reason (newest mutual's first name)
+POST /users/me/suggestions/:userId/dismiss → suggestion_dismissals createMany skipDuplicates
+```
+
+## 4k. Data export and login alerts
+
+```
+POST /users/me/export → protect → exportLimiter → validate(exportData) → userController.exportData
+  → exportService.exportData: reauthService.assertReauthenticated (password, or a recent Google sign-in)
+    → ~17 parallel reads (account, profile, settings, posts + media + hashtags, comments, likes, saves,
+      followers, following, requests both ways, blocks, mutes, stories, notifications, reports made,
+      active sessions, last 500 auth_events) → audit data_exported
+  → Content-Disposition: attachment; Cache-Control: no-store → { status, data }
+Login alert: authService.completeLogin [tx] counts sessions with this deviceName + user agent (seen)
+  and all sessions (earlier) → newDevice = earlier > 0 && seen == 0
+  → after commit: audit new_device_login; settings.loginAlerts → queueMail(emails.newLogin)
+```
+
 ## 5. Background job
 
 ```
@@ -388,10 +484,11 @@ jobs/authCleanup.runAuthCleanup
     delete codes          created > 1 d ago
     delete auth_events    older than 180 d
     delete notifications  older than NOTIFICATION_RETENTION_DAYS (90)
+    delete stories        expired, or by purged users                       (story_views cascade)
     recount hashtags.posts_count; delete unused hashtags older than 1 d
     (before purging users: subtract their follows from other users' counters, note which
-     posts/comments they liked, saved or commented on; after the delete, recount those
-     counters; after commit: delete their avatar and post photo files)
+     posts/comments/stories they liked, saved, commented on or viewed; after the delete, recount
+     those counters; after commit: delete their avatar, post and story files)
 ```
 
 ## 6. Data model (prisma/schema.prisma)
@@ -416,6 +513,11 @@ users ─┬─< notifications (recipient_id; actor_id, post_id, comment_id all 
        ├─< reports (reporter_id; post_id/comment_id/user_id SET NULL, so reports outlive content)
        └─< moderation_actions (moderator_id SET NULL; target_type + target_id, no FK: audit log)
 posts ─< post_hashtags >─ hashtags (name unique, posts_count)
+users ─┬─< stories (expires_at, views_count) ─< story_views (story_id, viewer_id)
+       └─< suggestion_dismissals (user_id, dismissed_id)
+users.activity_visibility ('everyone'|'followers'|'onlyMe', CHECK) and users.show_location are settings
+stored as columns; posts.featured_at = staff pick; comments.is_offensive = matched the word list;
+reports.story_id (SET NULL) for type STORY.
 users.role: USER | REVIEWER | ADMIN. GIN trigram indexes: users.username/name, posts.title/description,
 hashtags.name (extension pg_trgm).
 users.followers_count / following_count, posts.likes/comments/saves/shares_count and
@@ -448,4 +550,9 @@ per flow above), `test/phone.test.js` (16 phone tests) , `test/users.test.js` (1
 tests) , `test/posts.test.js` (17 post/feed/comment tests), `test/videos.test.js` (7 video/reel tests,
 clips generated with ffmpeg) and `test/notifications.test.js` (31 tests: the WebSocket login/close codes/
 logout disconnect, every event type, undo, read/delete across devices, settings and banners, cleanup; it
-starts a real server on a random port and connects with a `ws` client like the app). Run `npm test`.
+starts a real server on a random port and connects with a `ws` client like the app),
+`test/safety.test.js`, `test/search.test.js`, `test/impact.test.js`, and for 4h–4k
+`test/privacy.test.js` (settings and every rule they drive, login alerts, export),
+`test/stories.test.js` and `test/discovery.test.js` (feed sort, explore views, featured, trending,
+stats, suggestions). 182 tests in all. Run `npm test`. TESTING.md maps every feature to its tests and
+Postman requests.

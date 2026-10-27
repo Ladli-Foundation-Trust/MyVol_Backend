@@ -23,6 +23,8 @@ const EVENTS = Object.freeze({
     ACCOUNT_REACTIVATED: 'account_reactivated',
     ACCOUNT_DEACTIVATED: 'account_deactivated',
     DELETION_SCHEDULED: 'deletion_scheduled',
+    DATA_EXPORTED: 'data_exported',
+    NEW_DEVICE_LOGIN: 'new_device_login',
 });
 
 // Fire-and-forget: the audit trail must never block or fail the action it records.

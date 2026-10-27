@@ -25,6 +25,21 @@ router.post('/posts/:postId/reject', validate({ params: schemas.postParams, body
     ok(res, await mod.rejectPost(req.user.id, req.params.postId, req.body)),
 );
 
+// Staff picks (Explore's "Featured" view).
+router.post('/posts/:postId/feature', validate({ params: schemas.postParams }), async (req, res) =>
+    ok(res, await mod.setFeatured(req.user.id, req.params.postId, true)),
+);
+
+router.delete('/posts/:postId/feature', validate({ params: schemas.postParams }), async (req, res) =>
+    ok(res, await mod.setFeatured(req.user.id, req.params.postId, false)),
+);
+
+// ---------- stories ----------
+router.delete('/stories/:storyId', validate({ params: schemas.storyParams, body: schemas.removeStory }), async (req, res) => {
+    await mod.removeStory(req.user.id, req.params.storyId, req.body);
+    res.json({ status: 'success', message: 'Story removed' });
+});
+
 // ---------- comments ----------
 router.delete('/comments/:commentId', validate({ params: schemas.commentParams, body: schemas.removeComment }), async (req, res) => {
     await mod.removeComment(req.user.id, req.params.commentId, req.body);

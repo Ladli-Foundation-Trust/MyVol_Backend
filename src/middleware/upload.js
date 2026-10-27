@@ -26,13 +26,35 @@ const postMulter = multer({
     },
 }).array('media', MAX_POST_MEDIA);
 
+// A story: one photo or video in "media" plus an optional caption. On disk, like posts.
+const storyMulter = multer({
+    storage: multer.diskStorage({ destination: os.tmpdir() }),
+    limits: {
+        fileSize: Math.max(env.MAX_POST_VIDEO_MB, env.MAX_POST_IMAGE_MB) * 1024 * 1024,
+        files: 1,
+        fields: 2,
+        fieldSize: 2 * 1024,
+    },
+}).single('media');
+
+// Runs on 'close', where a throw would crash the server, so it is defensive: after a
+// multer error (e.g. a second file for a story) req.files/req.file can hold entries
+// that were never written to disk (no path).
 const removeTempFiles = (req) => {
-    for (const file of req.files ?? []) fs.rm(file.path, { force: true }, () => {});
+    const files = Array.isArray(req.files) ? req.files : Object.values(req.files ?? {}).flat();
+    for (const file of [...files, req.file]) {
+        if (typeof file?.path === 'string') fs.rm(file.path, { force: true }, () => {});
+    }
 };
 
 const postUpload = (req, res, next) => {
     res.on('close', () => removeTempFiles(req));
     postMulter(req, res, next);
+};
+
+const storyUpload = (req, res, next) => {
+    res.on('close', () => removeTempFiles(req));
+    storyMulter(req, res, next);
 };
 
 const requireFile = (req, res, next) => {
@@ -42,4 +64,11 @@ const requireFile = (req, res, next) => {
     next();
 };
 
-module.exports = { avatarUpload, postUpload, requireFile, MAX_POST_MEDIA };
+const requireMedia = (req, res, next) => {
+    if (!req.file) {
+        return next(new AppError('Attach a photo or video in the "media" form field', 400, undefined, 'FILE_REQUIRED'));
+    }
+    next();
+};
+
+module.exports = { avatarUpload, postUpload, storyUpload, requireFile, requireMedia, MAX_POST_MEDIA };

@@ -8,8 +8,8 @@ const AppError = require('../utils/appError');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Columns needed to render a user anywhere.
-const CARD_SELECT = { id: true, username: true, name: true, avatarKey: true, isPrivate: true };
+// Columns needed to render a user anywhere (activityVisibility: for canViewActivities).
+const CARD_SELECT = { id: true, username: true, name: true, avatarKey: true, isPrivate: true, activityVisibility: true };
 
 // Prisma `where` for a User relation: neither that user nor the viewer has blocked the
 // other. Spread it next to `status: 'ACTIVE'` wherever other people are listed.
@@ -72,6 +72,16 @@ const canView = (viewerId, user, relation) => {
     return !user.isPrivate || relation.followStatus === 'following';
 };
 
+// Posts ("activities") add the owner's whoCanViewActivities on top of canView:
+// 'everyone', 'followers' (approved followers only, even on a public account) or
+// 'onlyMe' (a private log). postService.visibleTo is the same rule as a Prisma `where`.
+const canViewActivities = (viewerId, user, relation) => {
+    if (user.id === viewerId) return true;
+    if (!canView(viewerId, user, relation)) return false;
+    if (user.activityVisibility === 'onlyMe') return false;
+    return user.activityVisibility !== 'followers' || relation.followStatus === 'following';
+};
+
 const isBlockedBetween = async (a, b, db = prisma) =>
     (await db.block.count({ where: { OR: [{ blockerId: a, blockedId: b }, { blockerId: b, blockedId: a }] } })) > 0;
 
@@ -91,4 +101,4 @@ const toCard = (user, viewerId, rel) => {
     };
 };
 
-module.exports = { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, isBlockedBetween, toCard };
+module.exports = { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, canViewActivities, isBlockedBetween, toCard };

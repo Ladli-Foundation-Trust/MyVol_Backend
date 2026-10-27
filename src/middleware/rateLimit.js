@@ -137,7 +137,24 @@ const reportLimiter = limiter({
     message: 'Too many reports. Please try again later',
 });
 
+const storyLimiter = limiter({
+    windowMinutes: 60,
+    limit: 30,
+    byUser: true,
+    message: 'You are sharing stories too fast. Please try again later',
+});
+
+// Data export builds a large file; a few per hour is plenty.
+const exportLimiter = limiter({
+    windowMinutes: 60,
+    limit: 5,
+    byUser: true,
+    message: 'Too many downloads. Please try again later',
+});
+
 module.exports = {
+    storyLimiter,
+    exportLimiter,
     searchLimiter,
     reportLimiter,
     testNotificationLimiter,
