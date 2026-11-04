@@ -369,8 +369,12 @@ trending) can be added later without a migration. The feed is chronological unti
 
 ### D43. Demo seed for local testing
 **Decision.** `npm run db:seed:demo` creates the app's demo volunteers (`@demo.myvolapp.local`) with avatars,
-follows, 5 reels (ffmpeg test patterns, or your own clips with `--videos`), photo posts, a carousel, likes,
+follows, 5 reels (your own clips with `--videos`), photo posts, a carousel, likes,
 comments and views, all through the real services. `--reset` removes them via the normal purge.
+Update 2026-11-02: the generated media (solid-colour avatars, tinted noise photos, ffmpeg test patterns)
+was replaced by real, openly licensed portraits, photos and clips committed in `demo-media/` (~13 MB),
+so the app can be demoed. They're committed rather than downloaded at seed time, so seeding needs no
+network and always gives the same result.
 
 ### D44. Notifications: one row per event, de-duplicated, undone with the action (2026-10-22)
 **Decision.** `notifications` has a `dedupe_key` unique per recipient (`like:<post>:<actor>`,

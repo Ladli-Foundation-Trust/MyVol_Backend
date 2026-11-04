@@ -337,10 +337,14 @@ Video media items: `{ id, type: 'video', url, thumbnailUrl, width, height, durat
 | 400 | `NOT_A_VIDEO` | `/view` on a post without a video |
 
 **Demo data:** `npm run db:seed:demo` creates the app's volunteers (priya_sharma, aarav_mehta, meera_iyer,
-rohan_gupta, ananya_singh; password `Volunteer2026`) with avatars, follows, 5 reels, 3 photo posts, a
+rohan_gupta, ananya_singh; password `Volunteer2026`) with avatars, follows, 5 reels, 6 photo posts, a
 photo+video carousel, likes, comments and views. Options: `-- --reset` (recreate), `-- --follow <your
 username>` (so they appear in your home feed), `-- --videos <folder>` (use your own clips for the reels
-instead of generated test patterns).
+instead of the ones in `demo-media/videos`).
+
+**Demo media:** both seeds use real, openly licensed portraits, activity photos and short clips from
+`demo-media/` (`index.js` hands them to the services; creators and licences in `demo-media/CREDITS.md`).
+To use the foundation's own media, replace the files and keep their names.
 
 ## Notifications (live over our own WebSocket)
 

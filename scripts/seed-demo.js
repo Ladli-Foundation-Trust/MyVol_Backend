@@ -7,75 +7,56 @@
 //   npm run db:seed:demo -- --follow <username>   also make your own account follow them,
 //                                                 so their posts show in your home feed
 //   npm run db:seed:demo -- --videos <folder>     use your own .mp4/.mov clips for the reels
-//                                                 (otherwise ffmpeg generates test patterns)
+//                                                 (otherwise the clips in demo-media/videos)
 //
+// Photos, portraits and clips come from demo-media/ (credits in demo-media/CREDITS.md).
 // Demo accounts: <username>@demo.myvolapp.local, password Volunteer2026
-const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
-const sharp = require('sharp');
 const env = require('../src/config/env');
 const prisma = require('../src/lib/prisma');
-const { FFMPEG } = require('../src/lib/videos');
+const media = require('../demo-media');
 const { hashPassword } = require('../src/utils/password');
 const { runAuthCleanup } = require('../src/jobs/authCleanup');
 const profiles = require('../src/services/profileService');
 const follows = require('../src/services/followService');
 const posts = require('../src/services/postService');
 const comments = require('../src/services/commentService');
+const notifications = require('../src/services/notificationService');
 
 const DOMAIN = '@demo.myvolapp.local';
 const PASSWORD = 'Volunteer2026';
 
+// `avatar` is a portrait in demo-media/avatars.
 const USERS = [
-    { username: 'priya_sharma', name: 'Priya Sharma', bio: 'Community organizer · Mumbai', city: 'Mumbai', color: '#F05B83' },
-    { username: 'aarav_mehta', name: 'Aarav Mehta', bio: 'Environment volunteer', city: 'Bengaluru', color: '#2E9E5B' },
-    { username: 'meera_iyer', name: 'Meera Iyer', bio: 'Education & child rights advocate', city: 'Chennai', color: '#813287' },
-    { username: 'rohan_gupta', name: 'Rohan Gupta', bio: 'Weekend volunteer, animal welfare', city: 'Hyderabad', color: '#E8912D' },
-    { username: 'ananya_singh', name: 'Ananya Singh', bio: 'Health camps & first-aid drives', city: 'Kolkata', color: '#3A7BD5' },
+    { username: 'priya_sharma', name: 'Priya Sharma', bio: 'Community organizer · Mumbai', city: 'Mumbai', avatar: 'priya' },
+    { username: 'aarav_mehta', name: 'Aarav Mehta', bio: 'Environment volunteer', city: 'Bengaluru', avatar: 'aarav' },
+    { username: 'meera_iyer', name: 'Meera Iyer', bio: 'Education & child rights advocate', city: 'Chennai', avatar: 'meera' },
+    { username: 'rohan_gupta', name: 'Rohan Gupta', bio: 'Weekend volunteer, animal welfare', city: 'Hyderabad', avatar: 'rohan' },
+    { username: 'ananya_singh', name: 'Ananya Singh', bio: 'Health camps & first-aid drives', city: 'Kolkata', avatar: 'ananya' },
 ];
 
-// [author, title, description, category, beneficiaries, hours, ffmpeg source]
+// [author, title, description, category, beneficiaries, hours, clip in demo-media/videos]
 const REELS = [
-    ['aarav_mehta', 'Tree Plantation Drive', 'Planted 50 saplings with local volunteers. Swipe for the before/after!', 'Environment', 50, 2, 'testsrc2=size=720x1280:rate=30'],
-    ['ananya_singh', 'Rainwater Harvesting Workshop', 'Full walkthrough of the rooftop setup so other societies can copy it.', 'Environment', 12, 3, 'mandelbrot=size=720x1280:rate=30'],
-    ['priya_sharma', 'Community Food Distribution', 'Meals for 120 families this weekend. Thank you, team!', 'Hunger & Poverty', 120, 4, 'life=size=720x1280:rate=15:mold=10:ratio=0.3:life_color=#F05B83:death_color=#1a1a1a'],
-    ['rohan_gupta', 'Street Animal Feeding Drive', 'Feeding and first aid for 40 street dogs in our area.', 'Animal Welfare', 40, 2, 'cellauto=size=720x1280:rate=30:rule=110'],
-    ['meera_iyer', 'School Science Fair Mentoring', 'Kids built water filters from scratch. So proud of them!', 'Education', 35, 5, 'smptehdbars=size=720x1280:rate=30'],
+    ['aarav_mehta', 'Tree Plantation Drive', 'Planted 50 saplings with local volunteers. Swipe for the before/after!', 'Environment', 50, 2, 'tree_planting'],
+    ['ananya_singh', 'Blood Donation & Health Camp', 'Free check-ups and a blood donation drive with the local samiti. 150 residents came by!', 'Health', 150, 5, 'health_camp'],
+    ['priya_sharma', 'Community Food Distribution', 'Meals for 120 families this weekend. Thank you, team!', 'Hunger & Poverty', 120, 4, 'food_distribution'],
+    ['rohan_gupta', 'Street Animal Feeding Drive', 'Feeding and first aid for 40 street dogs in our area.', 'Animal Welfare', 40, 2, 'animal_feeding'],
+    ['meera_iyer', 'School Science Fair Mentoring', 'Kids built models from scratch for the science fair. So proud of them!', 'Education', 35, 5, 'kids_mentoring'],
 ];
 
-// [author, title, description, category, beneficiaries, hours, colour]
+// [author, title, description, category, beneficiaries, hours, photos in demo-media/photos]
 const PHOTO_POSTS = [
-    ['priya_sharma', 'Child Rights Awareness Camp', 'Sessions with 60 parents on school enrolment and child safety.', 'Child Rights', 60, 3, '#F05B83'],
-    ['ananya_singh', 'Free Health Camp', 'Blood pressure and sugar checks for 200 residents.', 'Health', 200, 6, '#3A7BD5'],
-    ['meera_iyer', 'Looking for 5 more volunteers this Sunday', 'Teaching session at the community library, 10 am. DM me!', 'Education', 0, 0, null],
+    ['priya_sharma', 'Child Rights Awareness Camp', 'Sessions with 60 parents on school enrolment and child safety.', 'Child Rights', 60, 3, ['child_rights', 'cat_child_rights']],
+    ['ananya_singh', 'Free Health Camp', 'Blood pressure and sugar checks for 200 residents.', 'Health', 200, 6, ['health_camp', 'cat_health']],
+    ['rohan_gupta', 'Stray Dog Vaccination Drive', 'Helped the vet team vaccinate 45 street dogs.', 'Animal Welfare', 45, 4, ['animal_feeding']],
+    ['meera_iyer', 'Evening Tutoring Classes', 'Maths and English for 25 children, every weekday at 6 pm.', 'Education', 25, 2, ['tutoring', 'cat_education']],
+    ['aarav_mehta', 'Sapling Drive at the School', 'Students planted and adopted 30 saplings around their school.', 'Environment', 30, 3, ['sapling_drive', 'tree_planting']],
+    ['meera_iyer', 'Looking for 5 more volunteers this Sunday', 'Teaching session at the community library, 10 am. DM me!', 'Education', 0, 0, []],
 ];
 
 const args = process.argv.slice(2);
 const argValue = (flag) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : undefined);
-
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'myvolapp-demo-'));
-
-const makeVideo = (i, source) => {
-    const file = path.join(tmp, `reel-${i}.mp4`);
-    execFileSync(FFMPEG, [
-        '-hide_banner', '-loglevel', 'error', '-y',
-        '-f', 'lavfi', '-i', source,
-        '-f', 'lavfi', '-i', `sine=frequency=${300 + i * 110}`,
-        '-t', '8', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', file,
-    ]);
-    return file;
-};
-
-const makePhoto = async (i, color) => {
-    const file = path.join(tmp, `photo-${i}.jpg`);
-    await sharp({ create: { width: 1080, height: 1350, channels: 3, noise: { type: 'gaussian', mean: 128, sigma: 40 } } })
-        .tint(color)
-        .jpeg()
-        .toFile(file);
-    return file;
-};
 
 const asUpload = (file) => ({
     path: file,
@@ -122,8 +103,7 @@ const main = async () => {
             },
         });
         ids[u.username] = user.id;
-        const avatar = await sharp({ create: { width: 512, height: 512, channels: 3, background: u.color } }).png().toBuffer();
-        await profiles.setAvatar(user.id, { buffer: avatar });
+        await profiles.setAvatar(user.id, media.avatar(u.avatar));
     }
 
     // Everyone follows everyone.
@@ -137,21 +117,20 @@ const main = async () => {
         console.log(`${extra} now follows the demo users.`);
     }
 
-    // Reels: own clips if given, else generated patterns.
+    // Reels: own clips if given, else the demo-media clips.
     const own = argValue('--videos');
     const clips = own ? fs.readdirSync(own).filter((f) => /\.(mp4|mov|m4v)$/i.test(f)).map((f) => path.join(own, f)) : [];
     const created = [];
-    for (const [i, [author, title, description, category, beneficiaries, hours, source]] of REELS.entries()) {
+    for (const [i, [author, title, description, category, beneficiaries, hours, clip]] of REELS.entries()) {
         process.stdout.write(`  reel ${i + 1}/${REELS.length}: ${title}... `);
-        const file = clips[i] ?? makeVideo(i, source);
-        const post = await posts.createPost(ids[author], { title, description, category, beneficiaries, hours, location: `${USERS.find((u) => u.username === author).city}, India` }, [asUpload(file)]);
+        const file = clips[i] ? asUpload(clips[i]) : media.video(clip);
+        const post = await posts.createPost(ids[author], { title, description, category, beneficiaries, hours, location: `${USERS.find((u) => u.username === author).city}, India` }, [file]);
         created.push(post);
         console.log('ok');
     }
 
-    for (const [i, [author, title, description, category, beneficiaries, hours, color]] of PHOTO_POSTS.entries()) {
-        const files = color ? [asUpload(await makePhoto(i, color)), asUpload(await makePhoto(i + 10, '#ffffff'))] : [];
-        created.push(await posts.createPost(ids[author], { title, description, category, beneficiaries, hours, location: `${USERS.find((u) => u.username === author).city}, India` }, files));
+    for (const [author, title, description, category, beneficiaries, hours, photos] of PHOTO_POSTS) {
+        created.push(await posts.createPost(ids[author], { title, description, category, beneficiaries, hours, location: `${USERS.find((u) => u.username === author).city}, India` }, photos.map(media.photo)));
     }
 
     // A carousel mixing a photo and a video.
@@ -159,7 +138,7 @@ const main = async () => {
         await posts.createPost(
             ids.aarav_mehta,
             { title: 'Environment Cleanup', description: 'Riverbank cleanup: 30 bags of waste collected.', category: 'Environment', beneficiaries: 0, hours: 3, location: 'Bengaluru, India' },
-            [asUpload(await makePhoto(20, '#2E9E5B')), asUpload(makeVideo(9, 'testsrc2=size=1280x720:rate=30'))],
+            [media.photo('river_cleanup_1'), media.video('river_cleanup'), media.photo('river_cleanup_2')],
         ),
     );
 
@@ -176,6 +155,8 @@ const main = async () => {
         await comments.addComment(post.author.id, post.id, { text: `Thank you, ${commenter.name.split(' ')[0]}!`, parentId: c.id });
     }
 
+    // Notifications are written after each action; wait for them before disconnecting.
+    await notifications.settle();
     console.log(`\nCreated ${USERS.length} demo users, ${created.length} posts (${REELS.length} reels).`);
     console.log(`Log in as any of: ${USERS.map((u) => u.username).join(', ')}  /  password: ${PASSWORD}`);
 };
@@ -186,6 +167,5 @@ main()
         process.exitCode = 1;
     })
     .finally(async () => {
-        fs.rmSync(tmp, { recursive: true, force: true });
         await prisma.$disconnect();
     });
