@@ -38,6 +38,9 @@ const exportData = async (auth, { password }, ctx) => {
         reports,
         sessions,
         loginHistory,
+        pledges,
+        badges,
+        vouches,
     ] = await Promise.all([
         prisma.profile.findUnique({ where: { userId } }),
         getSettings(userId),
@@ -60,6 +63,10 @@ const exportData = async (auth, { password }, ctx) => {
         prisma.report.findMany({ where: { reporterId: userId }, orderBy: { createdAt: 'asc' }, select: { type: true, reason: true, category: true, details: true, status: true, createdAt: true } }),
         prisma.session.findMany({ where: { userId, revokedAt: null }, select: { deviceName: true, userAgent: true, ip: true, createdAt: true, lastUsedAt: true } }),
         prisma.authEvent.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 500, select: { type: true, ip: true, userAgent: true, createdAt: true } }),
+        prisma.pledge.findMany({ where: { userId }, orderBy: { createdAt: 'asc' }, select: { postId: true, fulfilledPostId: true, createdAt: true } }),
+        prisma.userBadge.findMany({ where: { userId }, orderBy: { earnedAt: 'asc' }, select: { badgeId: true, earnedAt: true } }),
+        // Times you were named as a companion on someone's inspired post, and your answer.
+        prisma.postCompanion.findMany({ where: { userId }, orderBy: { createdAt: 'asc' }, select: { postId: true, status: true, createdAt: true, respondedAt: true } }),
     ]);
 
     audit.record(audit.EVENTS.DATA_EXPORTED, { userId, ctx });
@@ -99,6 +106,8 @@ const exportData = async (auth, { password }, ctx) => {
             media: p.media.map((m) => ({ type: m.type.toLowerCase(), url: url(m.key), thumbnailUrl: url(m.thumbnailKey) })),
             likesCount: p.likesCount,
             commentsCount: p.commentsCount,
+            inspiredByPostId: p.inspiredById,
+            rippleStatus: p.rippleStatus,
             createdAt: p.createdAt,
             editedAt: p.editedAt,
         })),
@@ -116,6 +125,9 @@ const exportData = async (auth, { password }, ctx) => {
         reportsMade: reports,
         activeSessions: sessions,
         loginHistory,
+        pledges,
+        rippleBadges: badges,
+        vouches,
     };
 };
 

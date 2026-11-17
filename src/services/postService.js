@@ -9,6 +9,7 @@ const { processVideo } = require('../lib/videos');
 const { afterCursor, toPage, decodeOffset, offsetPage } = require('../utils/cursor');
 const notifications = require('./notificationService');
 const impact = require('./impactService');
+const ripple = require('./rippleService');
 const { getSettings, settingsFor } = require('./settingsService');
 const { AREA_CATEGORIES } = require('../validators/postValidators');
 const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, canViewActivities, toCard } = require('./socialGraph');
@@ -114,18 +115,19 @@ const commentAllowed = (policy, isMine, relation) => {
     return true;
 };
 
-// Posts as the app shows them, with likedByMe/savedByMe, the author's follow state and
-// the author's post settings (location, like count, comments, sharing), in four extra
-// queries for the whole page.
+// Posts as the app shows them, with likedByMe/savedByMe, the author's follow state,
+// the author's post settings (location, like count, comments, sharing) and the ripple
+// facts (rippleService.postFacts), in a handful of extra queries for the whole page.
 const toPosts = async (viewerId, posts) => {
     if (posts.length === 0) return [];
     const ids = posts.map((p) => p.id);
     const authorIds = [...new Set(posts.map((p) => p.authorId))];
-    const [likes, saves, rel, prefsOf] = await Promise.all([
+    const [likes, saves, rel, prefsOf, rippleOf] = await Promise.all([
         prisma.postLike.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true } }),
         prisma.postSave.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true } }),
         relationsFor(viewerId, authorIds),
         settingsFor(authorIds),
+        ripple.postFacts(viewerId, posts),
     ]);
     const liked = new Set(likes.map((l) => l.postId));
     const saved = new Set(saves.map((s) => s.postId));
@@ -166,6 +168,8 @@ const toPosts = async (viewerId, posts) => {
             viewsCount: p.viewsCount,
             likedByMe: liked.has(p.id),
             savedByMe: saved.has(p.id),
+            // inspiredBy, inspiredCount, pledgesCount, myPledge
+            ...rippleOf(p),
             commentPolicy: prefs.whoCanComment,
             canComment: commentAllowed(prefs.whoCanComment, isMine, rel(p.authorId)),
             canShare: isMine || prefs.allowSharing,
@@ -264,8 +268,11 @@ const processUpload = async (file, position) => {
 
 // Photos and videos are processed and saved first (videos one at a time, see
 // lib/videos.js); if anything then fails, the saved files are deleted again.
-// A post whose only item is a video is a reel.
-const createPost = async (authorId, data, files = []) => {
+// A post whose only item is a video is a reel. `inspiredByPostId` links it into the
+// ripple of the post that inspired it (rippleService) and fulfils a pledge on that post.
+// The link starts PENDING: it counts once one of the `companions` (people who were
+// there) vouches for it, or a reviewer confirms it.
+const createPost = async (authorId, { inspiredByPostId, companions = [], ...data }, files = []) => {
     if (files.length === 0 && !data.description) {
         throw new AppError(
             'A post without photos needs a description',
@@ -273,6 +280,12 @@ const createPost = async (authorId, data, files = []) => {
             [{ field: 'description', message: 'is required when there are no photos' }],
             'DESCRIPTION_REQUIRED',
         );
+    }
+    let companionIds = [];
+    if (inspiredByPostId) {
+        await ripple.checkInspiration(authorId, inspiredByPostId);
+        const author = await prisma.user.findUnique({ where: { id: authorId }, select: { id: true, isPrivate: true, activityVisibility: true } });
+        companionIds = await ripple.checkCompanions(author, inspiredByPostId, companions);
     }
 
     const saved = [];
@@ -287,23 +300,30 @@ const createPost = async (authorId, data, files = []) => {
             rows.push(row);
         }
 
-        const [post, medalId] = await prisma.$transaction(async (tx) => {
+        const [post, notificationIds] = await prisma.$transaction(async (tx) => {
             const created = await tx.post.create({
                 data: {
                     authorId,
                     ...data,
+                    inspiredById: inspiredByPostId ?? null,
+                    rippleStatus: inspiredByPostId ? 'PENDING' : null,
                     status: env.POST_AUTO_APPROVE ? 'APPROVED' : 'UNDER_REVIEW',
                     isReel: rows.length === 1 && rows[0].type === 'VIDEO',
                     media: { create: rows },
                 },
-                select: { id: true },
+                select: { id: true, authorId: true, inspiredById: true },
             });
             await setPostHashtags(tx, created.id, extractHashtags(data.title, data.description));
-            // Auto-approved = approved now, so it may complete a medal tier.
-            const medal = env.POST_AUTO_APPROVE ? await impact.checkMedal(tx, authorId) : null;
-            return [await tx.post.findUnique({ where: { id: created.id }, include: POST_INCLUDE }), medal];
+            if (inspiredByPostId) await ripple.fulfillPledge(tx, authorId, inspiredByPostId, created.id);
+            // Auto-approved = approved now, so it may complete a medal tier. The ripples
+            // above grow later, when the link is verified (rippleService.countIfReady).
+            const ids = [
+                ...(env.POST_AUTO_APPROVE ? [await impact.checkMedal(tx, authorId)] : []),
+                ...(await ripple.addCompanions(tx, created, companionIds)),
+            ];
+            return [await tx.post.findUnique({ where: { id: created.id }, include: POST_INCLUDE }), ids];
         });
-        notifications.deliver(medalId);
+        notifications.deliver(notificationIds);
         return (await toPosts(authorId, [post]))[0];
     } catch (err) {
         await removeFiles(saved);
@@ -644,6 +664,7 @@ module.exports = {
     POST_INCLUDE,
     toPosts,
     findVisiblePost,
+    visibleTo,
     commentAllowed,
     extractHashtags,
     hashtagFeed,

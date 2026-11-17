@@ -16,7 +16,12 @@ router.get('/unread-count', n.unreadCount);
 router.post('/read-all', validate({ body: schemas.markAllRead }), n.markAllRead);
 // Checks the app's WebSocket + banner code (live delivery itself is at /api/v1/ws).
 router.post('/test', limits.testNotificationLimiter, n.test);
+// The phone's FCM token for notifications while the app is closed (D77). Tied to this
+// login's session.
+router.put('/push-token', validate({ body: schemas.pushToken }), n.registerPushToken);
+router.delete('/push-token', n.removePushToken);
 
+router.get('/:notificationId', notification, n.getOne);
 router.post('/:notificationId/read', notification, n.markRead);
 router.delete('/:notificationId', notification, n.remove);
 

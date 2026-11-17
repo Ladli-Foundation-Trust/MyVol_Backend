@@ -7,6 +7,7 @@ const audit = require('./auditService');
 const { toAvatar } = require('../lib/images');
 const { settlePendingRequests, requiresApproval } = require('./followService');
 const impact = require('./impactService');
+const ripple = require('./rippleService');
 const { storySummary } = require('./storyService');
 const { getSettings } = require('./settingsService');
 const { findActiveUser, relationsFor, canView, canViewActivities } = require('./socialGraph');
@@ -94,11 +95,12 @@ const countPosts = (userId, isMe) => prisma.post.count({ where: { authorId: user
 // ---------- own profile ----------
 
 const getMe = async (userId) => {
-    const [user, pendingRequestsCount, postsCount, impactSummary, stories] = await Promise.all([
+    const [user, pendingRequestsCount, postsCount, impactSummary, rippleSummary, stories] = await Promise.all([
         prisma.user.findUnique({ where: { id: userId }, select: PROFILE_SELECT }),
         prisma.followRequest.count({ where: { targetId: userId, requester: { status: 'ACTIVE' } } }),
         countPosts(userId, true),
         impact.summaryFor(userId),
+        ripple.summaryFor(userId),
         storySummary(userId, userId),
     ]);
     const nextChange = user.usernameChangedAt && new Date(user.usernameChangedAt.getTime() + env.USERNAME_CHANGE_COOLDOWN_DAYS * DAY_MS);
@@ -106,6 +108,7 @@ const getMe = async (userId) => {
     return {
         ...toProfile(user, userId, SELF, postsCount),
         impact: impactSummary,
+        ripple: rippleSummary,
         stories,
         showPersonalDetails: Boolean(user.profile?.showPersonalDetails),
         pendingRequestsCount,
@@ -195,21 +198,24 @@ const removeAvatar = async (userId) => {
 const getProfile = async (viewerId, idOrUsername) => {
     const user = await findActiveUser(idOrUsername, { viewerId, select: PROFILE_SELECT });
     if (user.id === viewerId) return getMe(viewerId);
-    const [rel, postsCount, muted, impactSummary, prefs, stories] = await Promise.all([
+    const [rel, postsCount, muted, impactSummary, rippleSummary, prefs, stories] = await Promise.all([
         relationsFor(viewerId, [user.id]),
         countPosts(user.id, false),
         prisma.mute.count({ where: { muterId: viewerId, mutedId: user.id } }),
         impact.summaryFor(user.id),
+        ripple.summaryFor(user.id),
         getSettings(user.id),
         storySummary(viewerId, user.id),
     ]);
     const relation = rel(user.id);
     const profile = toProfile(user, viewerId, relation, relation.blockedByMe ? 0 : postsCount);
+    const statsHidden = relation.blockedByMe || !prefs.showImpactStats;
     return {
         ...profile,
         // Public totals, like the follower counts (impactService), unless the owner turned
-        // showImpactStats off; none across a block.
-        impact: relation.blockedByMe || !prefs.showImpactStats ? null : impactSummary,
+        // showImpactStats off; none across a block. The ripple follows the same switch.
+        impact: statsHidden ? null : impactSummary,
+        ripple: statsHidden ? null : rippleSummary,
         // The follow button: "Request" when approval is needed, disabled when paused.
         followRequiresApproval: requiresApproval({ isPrivate: user.isPrivate, whoCanFollow: prefs.whoCanFollow }),
         followsPaused: prefs.whoCanFollow === 'none',

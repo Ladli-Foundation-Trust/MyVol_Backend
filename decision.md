@@ -630,6 +630,181 @@ email the account.
 every IP change of a mobile network. The first login after signup isn't "new".
 **Trade-off.** Sessions are deleted 30 days after they end, so a device unused for longer alerts again.
 
+## Ripple (2026-11-13)
+
+Product choice after a market scan: badges alone are common (Benevity, Deed, MY Bharat), and MY Bharat
+already owns "verified volunteering record" in India. A volunteer social feed that shows *who your
+activities inspired* was the open spot. Plan: Ripple first, then vouching as its quality filter (step 2),
+then the app screens.
+
+### D67. The ripple is a link on posts, walked by a recursive query
+**Decision.** `posts.inspired_by_post_id` (nullable, ON DELETE SET NULL), set only on create, to a post the
+author can see and that isn't their own. A user's ripple is one `WITH RECURSIVE` query down from all their
+approved posts, computed on read like impact (D56).
+**Why.** One column needs no new graph store. Links only ever point at older posts, so loops are impossible
+(MAX_DEPTH = 20 bounds the walk anyway). Computing on read can't drift from the posts.
+**Trade-off.** A profile view now runs one recursive query. That's cheap at today's chain sizes; if it isn't
+later, cache the numbers on `users` and recount in the cleanup job.
+
+### D68. Counted posts, people not posts, depth = shortest path
+**Decision.** A post counts when it is APPROVED and its author ACTIVE. A post that doesn't count also cuts off
+everything below it. `people` = distinct authors, never the owner. `depth` = the fewest links from one of the
+owner's posts (min per post). `cities` = distinct first parts of `location` for authors who show it (the same
+rule as Explore's stats).
+**Why.** Distinct people is the anti-spam rule: one person posting ten "inspired" activities is still one
+person. Rejected, deleted and suspended content shouldn't inflate anyone's ripple.
+
+### D69. Ripple badges are stored and kept, unlike medals
+**Decision.** `user_badges (user_id, badge_id)`. When a post starts to count (auto-approve on create, or a
+reviewer's approval), every author up the chain is re-measured and any new badge is inserted with one
+`badge` notification. A badge stays even if the ripple later shrinks.
+**Why.** The product decision: badges are not taken back. A table also makes the "earned on" date real, and
+Passport badges can reuse it later.
+**Trade-off.** Badges are awarded only on those events, so a badge whose rule is changed later doesn't
+back-fill until the next ripple event.
+
+### D70. Pledges: 60 days, renewable, fulfilled by linking
+**Decision.** `pledges (user_id, post_id, fulfilled_post_id)`. Open for 60 days; pledging again after expiry
+renews it. Creating an inspired post fulfils the pledge, even an expired one. A fulfilled pledge can't be
+cancelled (409) because it is the record of what happened. The cleanup job deletes expired, unfulfilled
+pledges.
+**Why.** A pledge is the emotional moment for the source's author ("Aarav will do it too") and a reminder for
+the pledger. Linking doesn't *require* a pledge, so nobody is blocked from crediting their inspiration.
+
+### D71. Privacy in the ripple
+**Decision.** Ripple numbers follow the impact rule (public unless `showImpactStats` is off; nothing across a
+block). In trees and in `inspiredBy`, a post the viewer can't see (private, followers-only, blocked) becomes
+`{ hidden: true }`: counted, but with no title or person.
+**Why.** The count is about the owner's influence and is safe to show. Who the people are follows each
+person's own privacy settings.
+
+### D72. Vouching: a link counts only once someone confirms it
+**Decision.** `posts.ripple_status` (PENDING → VERIFIED | REJECTED, null without a link). A new linked post
+is PENDING. It becomes VERIFIED when the first named companion (`post_companions`) confirms "I was there",
+or when a reviewer verifies it. Only VERIFIED links are walked (D68's COUNTED now includes it). The `ripple`
+notification and badges fire when a post is both approved and verified, whichever comes second
+(`countIfReady`). Answers are final; declines are not announced. Existing linked posts were backfilled to
+PENDING (dev data only).
+**Why.** Without a check, anyone can grow a friend's ripple by tagging their post. A second person who was
+there is the cheapest real signal: it costs the cheater a second, independent account that is willing to
+lie, and vouching needs a verified email or phone.
+**Trade-off.** Honest solo volunteers wait for a reviewer (D74). Companions are named on create only; adding
+one later needs an edit endpoint.
+
+### D73. Who can vouch
+**Decision.** At most 5 companions (`MAX_COMPANIONS`). Each must be active and not blocked either way (shown
+as "not found"), not the author, and **not anyone up the inspiration chain** (`chainAuthors`, the same walk
+up as badges). They must allow the author to tag them (`whoCanTag`, which until now was only stored, D59) and
+be able to see the author's activities, otherwise they couldn't open the post to answer.
+**Why.** The people up the chain are exactly the ones whose ripple grows, so their vouch is worthless.
+Reusing `whoCanTag` keeps one setting for "who can put my name on a post". Everyone sees only *confirmed*
+companions: a pending or declined name stays between the author and that person.
+**Trade-off.** With POST_AUTO_APPROVE off, the request arrives before the post is approved, and answering
+fails (the post isn't visible yet) until it is.
+
+### D74. Reviewers confirm when nobody can vouch
+**Decision.** The author can ask (`POST /posts/:id/ripple/review-request`, first date kept). Reviewers see
+asked-for links oldest first (`GET /admin/ripple`, `?all=true` for every pending one) with the source post
+and every companion's answer. Verify/reject are logged (VERIFY_RIPPLE / REJECT_RIPPLE) and send one
+`ripple_reviewed` notification (upserted, like post reviews). A reviewer's rejection stands over later
+vouches; a reviewer can overturn either way. Rejecting a verified link removes it from ripples but badges
+stay (D69).
+**Why.** Solo volunteering is common; they need a path that doesn't depend on friends. Asking keeps the queue
+small instead of making staff look at every pending link.
+
+### D75. Badge notifications name their badge and open the ripple
+**Decision.** A `badge` notification now carries `badge: { id, label, description }` (read from its dedupe
+key), and its `url` is `myvolapp://ripple/<recipientId>` instead of the profile. The app celebrates a badge
+from that field, both live (WebSocket) and at app start for unread badge rows earned while it was closed.
+Celebrating marks the row read, so each badge celebrates once.
+**Why.** The message text is for people, and parsing it would break the first time the copy changes. The
+ripple screen is where a badge means something (who you inspired), so the tap goes there. Nothing new is
+stored: the badge id was already in `dedupe_key` (`badge:<id>`).
+
+### D76. Hidden ripple badges (the Passport, cut down)
+**Decision.** Three secret badges in `config/ripple.js` with `hidden: true`: Six Degrees (a chain 6 deep),
+Full Circle (someone 2+ levels down posted in your profile city) and Spotlight (one post inspired 10
+volunteers). Until earned, `GET …/ripple` shows only their `hint` (label, description and `requires` are
+null) and they are never `next`. Two new numbers decide them, `hometown` and `bestPost`, computed in the
+same recursive query (it now carries each node's `root_id`); responses still show only people, depth and
+cities (`publicStats`). Badge notifications carry `hidden` so the app can say "Secret badge unlocked".
+**Why.** The user chose this over per-cause Passport stamps (2026-11-14): stamps are common elsewhere,
+secrets fit Ripple and reuse `user_badges` with no migration. Full Circle uses the post's city only when its
+author shows their location, like `cities`. Profile city changes don't recheck old ripples: badges are
+checked when a ripple grows (onCounted).
+**Trade-off.** The ids (`full_circle`…) are in responses, so a curious user can read them. They're not
+security, only a surprise.
+
+### D77. Notifications for a closed app over FCM (2026-11-14 → 2026-11-16)
+**Decision.** Our WebSocket stays the channel while the app is open. When a banner is due the server
+also sends FCM a **display message** (`notification.body` = the same text as the in-app list,
+`android.notification.channel_id` = the channel the user's settings picked, `tag` = the notification id,
+`data` = `{ type: 'notification', notificationId, url, tag }`, priority HIGH, TTL 24 h). Android shows it
+by itself, with no app code, in every state. Tokens live in `push_tokens`, one per **session**
+(logout/revoke/expiry/inactive account stops pushes; a token seen on another session moves). Key:
+`secrets/firebase-service-account.json` (git-ignored) via `FIREBASE_SERVICE_ACCOUNT_PATH`, or the JSON
+(or its base64) in `FIREBASE_SERVICE_ACCOUNT_JSON`; neither = push off. Sender: FCM HTTP v1 via
+`google-auth-library`. Startup logs "Closed-app notifications (FCM): on/off".
+**Why.** Android and iOS don't let a closed app hold a socket; only the OS push channel (FCM/APNs) can
+reach it. The user first chose "no hosted services" (D47) and then FCM as a content-free *doorbell*
+(data-only `{type:'wake', notificationId}`; the app fetched the text itself). Tested on the user's Moto
+g85 on 2026-11-16: the wake reached the phone and Android started the app, but Motorola's freezer
+(`moto_freezer`, "cch-empty") froze the process before its JavaScript could fetch and show anything.
+expo-notifications runs the background task asynchronously after `onMessageReceived` returns, so nothing
+keeps the process alive; Xiaomi, Oppo, Vivo and Realme are as aggressive or worse. A display message is
+the industry practice (Instagram, X, LinkedIn) because it doesn't depend on app code running. The user
+chose "follow the best practice" over the doorbell. Trade-off: Google relays the notification text
+(e.g. "Priya Sharma commented: …"), not the post or anything else; the server still decides whether
+to send it at all.
+**When.** Whenever `alertFor` says a banner is due, **even if a socket looks connected**: Android freezes
+a backgrounded app's network while the server still holds its socket (until the next heartbeat, up to
+~60 s), and frames sent then are lost. No banner (settings off, pauseAll, re-alert window) → no push; the
+app catches up from the list. Quiet hours → the `silent` channel.
+**No duplicates.** Both copies carry the notification id: the app's local notifications use it as their
+identifier and FCM as its tag, so Android replaces rather than stacks. The app shows each id once:
+in the foreground the socket's copy shows and an FCM copy is hidden by the notification handler; in the
+background (token registered) the app skips the socket copy because Android already shows FCM's.
+**Taps.** `data.url` (`myvolapp://post/…`, `/user/…`, `/ripple/…`) goes through React Navigation's
+`linking` (`getInitialURL` reads the tap that launched a killed app once the navigator mounts, after the
+session is restored; `subscribe` hears taps while running). No website needed.
+**API.** `PUT /notifications/push-token {token, platform: android|ios}` → `{ registered, enabled }`,
+`DELETE /notifications/push-token`, `GET /notifications/:id` → `{ notification, unreadCount }`.
+**Robustness.** Dead token = 404, UNREGISTERED or a 400 naming the registration token (not every
+INVALID_ARGUMENT: a payload bug must not wipe every phone's token). 429/5xx/network errors retry once after
+1 s. The app re-registers on every sign-in/launch, on FCM token rotation, and when it returns to the
+foreground after a failed registration. Migrations `20261116090000_push_token_keys` and
+`20261116120000_drop_push_token_keys` added and then removed a "push key" built for the doorbell design
+(net effect: none; both were dev-only).
+**Limits.** A phone the user force-stopped (Settings → Force stop) gets nothing until the app is opened:
+Android blocks FCM for it. iOS needs an Apple developer account + APNs key in Firebase.
+**Tests.** `test/push.test.js` swaps the transport (`pushService.setTransport`) and checks the FCM
+message shape (`pushService.toMessage`); `.env.test` leaves `FIREBASE_SERVICE_ACCOUNT_PATH` empty so
+nothing talks to Google. `notificationService.settle()` drains until empty, because a send starts a push.
+
+### D78. Public link previews for myvol.org (2026-11-16)
+**Decision.** `GET /api/v1/previews/posts/:postId`, `/previews/users/:user` and `/previews/ripple/:user`,
+with **no login**, feed the website (`ladli/myvol-web`, Next.js) that serves every share link
+(`https://myvol.org/post/<id>`, `/user/<id>`, `/ripple/<id>`) and its Open Graph tags. They return only what
+a logged-out stranger may see:
+- **posts:** APPROVED, author ACTIVE, public and activities for everyone (Explore's rule without blocks).
+  Anything else is the same 404 `POST_NOT_FOUND` as a missing post, so a preview never confirms a private post
+  exists. Location only if the author shows it. First photo or video cover. Description cut to 300 characters.
+- **users:** a private account returns the card only (name, username, photo). A public one adds bio and counts;
+  the post count only if activities are for everyone.
+- **ripple:** totals + badge ids, or `null` when the owner turned `showImpactStats` off. Never the tree, which
+  names other people.
+
+Responses carry `Cache-Control: public, max-age=300` (the site also revalidates every 5 minutes), so a post
+made private leaves previews within minutes.
+**Why.** Chat apps build link cards from the page's Open Graph tags, fetched by a logged-out bot, and a person
+without the app needs to see what was shared. The existing routes all require a login and apply the viewer's
+relations, so a separate, deliberately narrower read model is safer than making them optional-auth.
+**App side.** `config/linking.js` `WEB_ORIGIN = 'https://myvol.org'`; app.json `android.intentFilters`
+(`autoVerify`, paths `/post/`, `/user/`, `/ripple/`); the site serves `/.well-known/assetlinks.json`. The
+production API must set `PUBLIC_BASE_URL=https://api.myvol.org` so image URLs in previews are public.
+**Tests.** `test/preview.test.js` (privacy matrix: private, followers-only, only-me, unapproved, inactive,
+hidden location, hidden impact). Postman folder 35.
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|
@@ -637,12 +812,14 @@ every IP change of a mobile network. The first login after signup isn't "new".
 | Sign in with Apple | Required by App Store rules if Google sign-in ships on iOS. Android-first for now. |
 | Real SMS delivery | Phone auth is built (D30) but codes go to the console. Needs a provider (MSG91 etc.) and a DLT-registered sender in India. |
 | Chat (Phase 14) and "who can message you" | Not needed yet (product decision 2026-10-24). The WebSocket in D47 is the transport it will use. |
-| Mentions, tags, reposts | No such features; `whoCanMention`, `whoCanTag`, `allowReposts`, `notifMentions` are stored (D59). |
+| Mentions, tags, reposts | No such features; `whoCanMention`, `allowReposts` are stored (D59). `whoCanTag` and `notifMentions` now drive ripple companions (D73). |
 | Presence ("active now") | `showActivityStatus` is stored; presence belongs with chat. |
 | Geo "near you" by distance | By profile city for now (D61); needs PostGIS + coordinates. `nearbyRadius` is stored. |
 | Sensitive-content flag on posts | `sensitiveContent` is stored; posts have no flag yet. |
 | Announcements / reminders / weekly digest emails | Settings stored; no sender yet. |
-| Permanent medal awards / certificates | Medals follow the current count (D57). Needs a `user_medals` table. |
+| Permanent medal awards / certificates | Medals follow the current count (D57). Needs a `user_medals` table (`user_badges` from D69 could hold them). |
+| Adding companions after posting | Companions are named on create only (D72). A reviewer request covers the case where nobody was named. |
+| Passport per-cause stamps | Parked after the market scan: common elsewhere. Hidden badges were built instead (D76). |
 | Turning off `POST_AUTO_APPROVE` | Moderation exists now (D54). It stays on until a reviewer is ready to work the queue; with it off, new posts start Under Review. |
 | Web admin panel | Staff use the `/admin` API through Postman for now (plan: "Later"). |
 | Cloud video (HLS, background processing) | Local ffmpeg for now (D41). |
@@ -650,7 +827,7 @@ every IP change of a mobile network. The first login after signup isn't "new".
 | Feed ranking by a model | Sorts and views are chronological (D61); trending has a simple score (D62). |
 | Mention notifications | No @mentions yet. `notifMentions` is already stored (D46). |
 | Grouped notifications ("X and 12 others") | Read-time grouping over the same rows when needed (D44). |
-| Notifications while the app is closed | Needs FCM/APNs, declined for now (D47). The app catches up on open. |
+| Closed-app notifications on iOS | Android is done over FCM (D77). iOS needs an Apple developer account + APNs key in Firebase. |
 | Multi-instance WebSocket fan-out (Redis pub/sub) | One instance for now (D47). |
 | Per-user time zone for quiet hours | `DEFAULT_TIMEZONE` until settings have a time zone (D45). |
 | S3/CDN storage | Swap `src/lib/storage.js` when a bucket exists (D34). |

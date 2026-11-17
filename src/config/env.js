@@ -74,6 +74,12 @@ const schema = z.object({
 
     // Email. Without SMTP_URL, mail is printed to the console outside production.
     SMTP_URL: z.url().optional(),
+    // FCM wake-ups for closed apps (pushService): the Firebase service-account key, as a
+    // file path relative to the project root, or (for hosts that only take env vars) the
+    // JSON itself or its base64 in FIREBASE_SERVICE_ACCOUNT_JSON, which wins if both are
+    // set. Neither = push off (the WebSocket still works).
+    FIREBASE_SERVICE_ACCOUNT_PATH: z.string().optional(),
+    FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
     MAIL_FROM: z.string().default('MyVolApp <no-reply@myvolapp.local>'),
 
     // Local testing only (Postman): echo 6-digit codes back as `devOtp` in API responses.

@@ -52,6 +52,11 @@ const postQueue = listQuery.extend({
     status: upper(['under_review', 'rejected', 'approved']).default('UNDER_REVIEW'),
 });
 
+// all=true: every pending link, not only those whose author asked for a review.
+const rippleQueue = listQuery.extend({
+    all: z.stringbool({ error: 'must be true or false' }).default(false),
+});
+
 const reportQueue = listQuery.extend({
     status: upper(['open', 'resolved', 'dismissed']).default('OPEN'),
     type: upper(['post', 'comment', 'user', 'story', 'problem']).optional(),
@@ -87,6 +92,7 @@ module.exports = {
     reportParams: id('reportId'),
     postQueue,
     reportQueue,
+    rippleQueue,
     approvePost,
     rejectPost,
     removeComment,

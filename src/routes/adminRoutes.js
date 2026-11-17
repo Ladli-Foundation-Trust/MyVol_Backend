@@ -34,6 +34,18 @@ router.delete('/posts/:postId/feature', validate({ params: schemas.postParams })
     ok(res, await mod.setFeatured(req.user.id, req.params.postId, false)),
 );
 
+// ---------- ripple links ----------
+// Inspired posts whose author asked for a review because nobody could vouch.
+router.get('/ripple', validate({ query: schemas.rippleQueue }), async (req, res) => ok(res, await mod.listRippleQueue(req.user.id, req.validatedQuery)));
+
+router.post('/posts/:postId/ripple/verify', validate({ params: schemas.postParams, body: schemas.approvePost }), async (req, res) =>
+    ok(res, await mod.verifyRipple(req.user.id, req.params.postId, req.body)),
+);
+
+router.post('/posts/:postId/ripple/reject', validate({ params: schemas.postParams, body: schemas.rejectPost }), async (req, res) =>
+    ok(res, await mod.rejectRipple(req.user.id, req.params.postId, req.body)),
+);
+
 // ---------- stories ----------
 router.delete('/stories/:storyId', validate({ params: schemas.storyParams, body: schemas.removeStory }), async (req, res) => {
     await mod.removeStory(req.user.id, req.params.storyId, req.body);

@@ -50,3 +50,7 @@ tmp/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Server credentials (Firebase service-account key for FCM, etc.). Never commit.
+secrets/
+*firebase-adminsdk*.json

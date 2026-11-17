@@ -59,6 +59,32 @@ enum NotificationType {
   POST_REJECTED
   // Reached a medal tier (impactService.checkMedal). No actor; dedupe key medal:<tier>.
   MEDAL_EARNED
+  // Ripple (rippleService): someone pledged "I'll do this too" on your post; someone
+  // posted an activity inspired by yours; you earned a ripple badge (no actor).
+  PLEDGE
+  RIPPLE
+  BADGE_EARNED
+  // Ripple vouching: "Aarav says you were with them, were you?" (to the companion);
+  // "Meera vouched for your activity" (to the author); a reviewer verified or rejected
+  // the inspiration link (no actor).
+  VOUCH_REQUEST
+  VOUCHED
+  RIPPLE_REVIEWED
+}
+
+// Whether an inspired post's link counts in ripples (null on posts with no link).
+// PENDING until a companion vouches or a reviewer verifies it (rippleService).
+enum RippleStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+// A companion's answer to "were you there?".
+enum VouchStatus {
+  PENDING
+  CONFIRMED
+  DECLINED
 }
 
 model User {
@@ -103,6 +129,7 @@ model User {
   updatedAt           DateTime      @updatedAt @map("updated_at")
 
   sessions          Session[]
+  pushTokens        PushToken[]
   verificationCodes VerificationCode[]
   oauthAccounts     OAuthAccount[]
   authEvents        AuthEvent[]
@@ -132,6 +159,10 @@ model User {
   storyViews        StoryView[]
   dismissalsMade    SuggestionDismissal[] @relation("dismisser")
   dismissalsGot     SuggestionDismissal[] @relation("dismissed")
+  pledges           Pledge[]
+  badges            UserBadge[]
+  companionOf       PostCompanion[]
+  ripplesVerified   Post[]             @relation("rippleVerifier")
 
   @@index([status, deletionScheduledAt])
   @@index([phone])
@@ -157,10 +188,31 @@ model Session {
 
   user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   refreshTokens RefreshToken[]
+  pushToken     PushToken?
 
   @@index([userId, revokedAt])
   @@index([expiresAt])
   @@map("sessions")
+}
+
+// FCM device tokens for closed-app wake-ups (pushService). One per signed-in session:
+// the token belongs to the phone's login, so a logout, a revoked session or an expired
+// one stops pushes (the sender only uses live sessions; deleting a session cascades).
+// A token moving to another session (someone else logs in on the phone) moves its row.
+model PushToken {
+  token     String   @id
+  sessionId String   @unique @map("session_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  // 'android' | 'ios'
+  platform  String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_tokens")
 }
 
 model RefreshToken {
@@ -330,8 +382,26 @@ model Post {
   editedAt        DateTime?  @map("edited_at")
   // Staff pick for Explore's "Featured" view (POST /admin/posts/:id/feature).
   featuredAt      DateTime?  @map("featured_at")
+  // Ripple: the post that inspired this activity. Set only when the post is created,
+  // always to an older post, so links can never form a loop. Deleting the source
+  // unlinks (the chain below it stops counting for the people above).
+  inspiredById    String?    @map("inspired_by_post_id") @db.Uuid
+  // Ripple vouching: a link counts only once VERIFIED, by a companion's confirmation
+  // or a reviewer. verifiedBy is that person. The author can ask a reviewer to look
+  // (reviewRequestedAt) when nobody who was there can vouch.
+  rippleStatus             RippleStatus? @map("ripple_status")
+  rippleVerifiedAt         DateTime?     @map("ripple_verified_at")
+  rippleVerifiedById       String?       @map("ripple_verified_by_id") @db.Uuid
+  rippleReviewRequestedAt  DateTime?     @map("ripple_review_requested_at")
+  rippleRejectionReason    String?       @map("ripple_rejection_reason")
 
   author        User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  inspiredBy    Post?          @relation("ripple", fields: [inspiredById], references: [id], onDelete: SetNull)
+  inspired      Post[]         @relation("ripple")
+  rippleVerifiedBy User?       @relation("rippleVerifier", fields: [rippleVerifiedById], references: [id], onDelete: SetNull)
+  companions    PostCompanion[]
+  pledges       Pledge[]       @relation("pledged")
+  fulfilled     Pledge[]       @relation("fulfilledBy")
   media         PostMedia[]
   likes         PostLike[]
   saves         PostSave[]
@@ -346,6 +416,10 @@ model Post {
   @@index([status, createdAt])
   @@index([category, status, createdAt])
   @@index([featuredAt])
+  // Ripple trees walk down from a post to the posts it inspired.
+  @@index([inspiredById])
+  // The reviewers' ripple queue (pending links, oldest request first).
+  @@index([rippleStatus, rippleReviewRequestedAt])
   // Search: trigram indexes make ILIKE '%word%' fast (pg_trgm).
   @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "posts_title_trgm_idx")
   @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "posts_description_trgm_idx")
@@ -413,6 +487,58 @@ model PostView {
   @@id([userId, postId])
   @@index([postId])
   @@map("post_views")
+}
+
+// "I'll do this too": a promise to do the activity of someone else's post. Open for
+// PLEDGE_DAYS (config/ripple.js); fulfilled when the user posts an activity inspired by
+// that post. Expired, unfulfilled pledges are deleted by the cleanup job.
+model Pledge {
+  userId          String   @map("user_id") @db.Uuid
+  postId          String   @map("post_id") @db.Uuid
+  fulfilledPostId String?  @map("fulfilled_post_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  user          User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post          Post  @relation("pledged", fields: [postId], references: [id], onDelete: Cascade)
+  fulfilledPost Post? @relation("fulfilledBy", fields: [fulfilledPostId], references: [id], onDelete: SetNull)
+
+  @@id([userId, postId])
+  @@index([userId, createdAt])
+  @@index([postId])
+  @@index([fulfilledPostId])
+  @@map("pledges")
+}
+
+// "Who was with you": people the author named on an inspired post. Each is asked to
+// vouch; the first confirmation verifies the post's ripple link (rippleService).
+// Answers are final.
+model PostCompanion {
+  postId      String      @map("post_id") @db.Uuid
+  userId      String      @map("user_id") @db.Uuid
+  status      VouchStatus @default(PENDING)
+  createdAt   DateTime    @default(now()) @map("created_at")
+  respondedAt DateTime?   @map("responded_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([postId, userId])
+  // "Vouch requests" for a user, newest first.
+  @@index([userId, status, createdAt])
+  @@map("post_companions")
+}
+
+// Badges a user has earned (ripple badges for now; config/ripple.js). Kept once earned,
+// even if the ripple later shrinks (a post deleted or rejected).
+model UserBadge {
+  userId   String   @map("user_id") @db.Uuid
+  badgeId  String   @map("badge_id")
+  earnedAt DateTime @default(now()) @map("earned_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, badgeId])
+  @@map("user_badges")
 }
 
 // One level of replies: parent_id points at a top-level comment, never at a reply.
@@ -614,7 +740,8 @@ model ModerationAction {
   id          String   @id @default(uuid()) @db.Uuid
   moderatorId String?  @map("moderator_id") @db.Uuid
   // APPROVE_POST, REJECT_POST, AUTO_HIDE_POST, DELETE_COMMENT, SUSPEND_USER,
-  // UNSUSPEND_USER, SET_ROLE, DISMISS_REPORT, RESOLVE_REPORT
+  // UNSUSPEND_USER, SET_ROLE, DISMISS_REPORT, RESOLVE_REPORT, FEATURE_POST,
+  // UNFEATURE_POST, VERIFY_RIPPLE, REJECT_RIPPLE
   action      String
   // post | comment | user | report
   targetType  String   @map("target_type")

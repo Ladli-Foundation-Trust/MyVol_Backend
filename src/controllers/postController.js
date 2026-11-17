@@ -1,5 +1,6 @@
 const posts = require('../services/postService');
 const comments = require('../services/commentService');
+const ripple = require('../services/rippleService');
 
 const ok = (res, data, statusCode = 200) => res.status(statusCode).json({ status: 'success', data });
 
@@ -41,6 +42,14 @@ exports.likes = async (req, res) => ok(res, await posts.listLikes(req.user.id, r
 exports.save = async (req, res) => ok(res, await posts.savePost(req.user.id, req.params.postId));
 exports.unsave = async (req, res) => ok(res, await posts.unsavePost(req.user.id, req.params.postId));
 exports.share = async (req, res) => ok(res, await posts.sharePost(req.user.id, req.params.postId));
+
+// ---------- ripple ----------
+
+exports.pledge = async (req, res) => ok(res, await ripple.pledge(req.user.id, req.params.postId));
+exports.unpledge = async (req, res) => ok(res, await ripple.unpledge(req.user.id, req.params.postId));
+exports.ripple = async (req, res) => ok(res, await ripple.getPostRipple(req.user.id, req.params.postId, req.validatedQuery));
+exports.vouch = async (req, res) => ok(res, await ripple.vouch(req.user.id, req.params.postId, req.body.answer));
+exports.requestRippleReview = async (req, res) => ok(res, await ripple.requestReview(req.user.id, req.params.postId));
 
 // ---------- comments ----------
 

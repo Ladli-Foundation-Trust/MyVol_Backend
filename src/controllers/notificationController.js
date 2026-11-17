@@ -1,4 +1,5 @@
 const notifications = require('../services/notificationService');
+const push = require('../services/pushService');
 const settings = require('../services/settingsService');
 const accountSettings = require('../services/accountSettingsService');
 
@@ -10,6 +11,13 @@ exports.list = async (req, res) => ok(res, await notifications.listNotifications
 
 exports.unreadCount = async (req, res) => ok(res, await notifications.unreadCount(req.user.id));
 
+exports.getOne = async (req, res) => ok(res, await notifications.getNotification(req.user.id, req.params.notificationId));
+
+// ---------- push token (FCM, D77): one per session ----------
+
+exports.registerPushToken = async (req, res) => ok(res, await push.registerToken(req.user.id, req.user.sessionId, req.body));
+
+exports.removePushToken = async (req, res) => ok(res, await push.unregisterToken(req.user.sessionId));
 exports.markRead = async (req, res) => ok(res, await notifications.markRead(req.user.id, req.params.notificationId));
 
 exports.markAllRead = async (req, res) => ok(res, await notifications.markAllRead(req.user.id, req.body));

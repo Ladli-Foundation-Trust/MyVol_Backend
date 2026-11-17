@@ -6,6 +6,7 @@ const { afterCursor, toPage } = require('../utils/cursor');
 const sessions = require('./sessionService');
 const notifications = require('./notificationService');
 const impact = require('./impactService');
+const ripple = require('./rippleService');
 const { POST_INCLUDE, toPosts } = require('./postService');
 const { findComment, removeComment: deleteCommentAndReplies } = require('./commentService');
 const { removeStory: deleteStory } = require('./storyService');
@@ -66,7 +67,10 @@ const listPosts = async (moderatorId, { status, cursor, limit }) => {
 // Approve or reject. Only a real change notifies the author ("Your … was approved"); an
 // approval that completes a medal tier also sends the medal.
 const reviewPost = async (moderatorId, postId, status, reason) => {
-    const post = await prisma.post.findUnique({ where: { id: postId }, select: { id: true, authorId: true, status: true, rejectionReason: true } });
+    const post = await prisma.post.findUnique({
+        where: { id: postId },
+        select: { id: true, authorId: true, status: true, rejectionReason: true },
+    });
     if (!post) throw notFound('Post');
     const rejectionReason = status === 'REJECTED' ? reason : null;
     const changed = post.status !== status || post.rejectionReason !== rejectionReason;
@@ -91,6 +95,9 @@ const reviewPost = async (moderatorId, postId, status, reason) => {
         return [
             changed ? await notifications.postReviewed(tx, { ...post, status }) : null,
             newlyApproved ? await impact.checkMedal(tx, post.authorId) : null,
+            // An approved inspired post grows the ripples above it, once its link is
+            // verified too.
+            ...(newlyApproved ? await ripple.countIfReady(tx, post.id) : []),
         ];
     });
     notifications.deliver(notificationIds);
@@ -99,6 +106,32 @@ const reviewPost = async (moderatorId, postId, status, reason) => {
 
 const approvePost = (moderatorId, postId, { note } = {}) => reviewPost(moderatorId, postId, 'APPROVED', note);
 const rejectPost = (moderatorId, postId, { reason }) => reviewPost(moderatorId, postId, 'REJECTED', reason);
+
+// ---------- ripple links (rippleService) ----------
+
+// Inspired posts waiting for a reviewer to confirm what inspired them.
+const listRippleQueue = (moderatorId, query) => ripple.reviewQueue(moderatorId, query);
+
+// Verify or reject an inspired post's link. Logged like every other review; the
+// author hears about a real change.
+const reviewRipple = async (moderatorId, postId, decision, reason) => {
+    const post = await prisma.post.findUnique({
+        where: { id: postId },
+        select: { id: true, authorId: true, inspiredById: true, rippleStatus: true, rippleRejectionReason: true },
+    });
+    if (!post) throw notFound('Post');
+    if (!post.inspiredById) throw new AppError('This post has no inspiration link to review', 409, undefined, 'NOT_INSPIRED');
+    const ids = await prisma.$transaction(async (tx) => {
+        const result = await ripple.review(tx, moderatorId, post, decision, reason);
+        if (result.changed) await log(tx, moderatorId, decision === 'VERIFIED' ? 'VERIFY_RIPPLE' : 'REJECT_RIPPLE', 'post', postId, reason);
+        return result.ids;
+    });
+    notifications.deliver(ids);
+    return { post: { id: postId, rippleStatus: decision.toLowerCase(), rippleRejectionReason: decision === 'REJECTED' ? reason : null } };
+};
+
+const verifyRipple = (moderatorId, postId, { note } = {}) => reviewRipple(moderatorId, postId, 'VERIFIED', note ?? null);
+const rejectRipple = (moderatorId, postId, { reason }) => reviewRipple(moderatorId, postId, 'REJECTED', reason);
 
 // Staff picks for Explore's "Featured" view. Only approved posts; featuring again keeps
 // the original date. Rejecting a post unfeatures it (reviewPost).
@@ -333,6 +366,9 @@ module.exports = {
     approvePost,
     rejectPost,
     setFeatured,
+    listRippleQueue,
+    verifyRipple,
+    rejectRipple,
     removeComment,
     removeStory,
     suspendUser,

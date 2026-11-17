@@ -23,6 +23,7 @@ const follows = require('../src/services/followService');
 const posts = require('../src/services/postService');
 const comments = require('../src/services/commentService');
 const notifications = require('../src/services/notificationService');
+const ripple = require('../src/services/rippleService');
 
 const DOMAIN = '@demo.myvolapp.local';
 const PASSWORD = 'Volunteer2026';
@@ -141,6 +142,25 @@ const main = async () => {
             [media.photo('river_cleanup_1'), media.video('river_cleanup'), media.photo('river_cleanup_2')],
         ),
     );
+
+    // A small ripple: Aarav's tree drive inspired Priya (Meera was with her and vouched),
+    // and Priya's post inspired Rohan (Ananya vouched). Aarav earns Spark; Ananya has
+    // pledged to do it too. Everyone follows everyone, so all of them can be companions.
+    const [aaravReel] = created;
+    const priyaTrees = await posts.createPost(
+        ids.priya_sharma,
+        { title: 'Saplings for our lane', description: 'Saw Aarav’s drive and planted 15 saplings on our street!', category: 'Environment', beneficiaries: 15, hours: 2, location: 'Mumbai, India', inspiredByPostId: aaravReel.id, companions: ['meera_iyer'] },
+        [media.photo('sapling_drive')],
+    );
+    await ripple.vouch(ids.meera_iyer, priyaTrees.id, 'confirm');
+    const rohanTrees = await posts.createPost(
+        ids.rohan_gupta,
+        { title: 'Shade trees at the shelter', description: 'Priya’s post got us planting at the animal shelter.', category: 'Environment', beneficiaries: 20, hours: 2, location: 'Hyderabad, India', inspiredByPostId: priyaTrees.id, companions: ['ananya_singh'] },
+        [media.photo('tree_planting')],
+    );
+    await ripple.vouch(ids.ananya_singh, rohanTrees.id, 'confirm');
+    await ripple.pledge(ids.ananya_singh, aaravReel.id);
+    created.push(priyaTrees, rohanTrees);
 
     // Some engagement so counters aren't all zero.
     const lines = ['Great initiative! 👏', 'Count me in next time', 'This is so inspiring', 'Which area was this in?'];

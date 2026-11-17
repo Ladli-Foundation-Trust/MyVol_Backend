@@ -2,12 +2,14 @@ const crypto = require('crypto');
 const prisma = require('../lib/prisma');
 const env = require('../config/env');
 const realtime = require('../lib/realtime');
+const push = require('./pushService');
 const storage = require('../lib/storage');
 const AppError = require('../utils/appError');
 const { afterCursor, toPage } = require('../utils/cursor');
 const { CARD_SELECT, relationsFor, isBlockedBetween, toCard } = require('./socialGraph');
 const { getSettings } = require('./settingsService');
 const { tierById } = require('../config/medals');
+const { badgeById } = require('../config/ripple');
 
 // The Activity tab, delivered live over our own WebSocket (lib/realtime.js).
 //
@@ -39,6 +41,12 @@ const TYPE_NAMES = {
     POST_APPROVED: 'approved',
     POST_REJECTED: 'rejected',
     MEDAL_EARNED: 'medal',
+    PLEDGE: 'pledge',
+    RIPPLE: 'ripple',
+    BADGE_EARNED: 'badge',
+    VOUCH_REQUEST: 'vouch_request',
+    VOUCHED: 'vouched',
+    RIPPLE_REVIEWED: 'ripple_reviewed',
 };
 
 // The setting (settingsService) that controls the phone banner for each type.
@@ -54,6 +62,15 @@ const ALERT_SETTING = {
     POST_REJECTED: 'notifActivityApproved',
     // A medal comes from an approval, so the same switch covers it.
     MEDAL_EARNED: 'notifActivityApproved',
+    // Ripple: someone reacting to your activity (an audience setting like likes, so
+    // "only people I follow" works), and badges like medals.
+    PLEDGE: 'notifLikes',
+    RIPPLE: 'notifLikes',
+    BADGE_EARNED: 'notifActivityApproved',
+    // Being named as a companion is like being tagged.
+    VOUCH_REQUEST: 'notifMentions',
+    VOUCHED: 'notifLikes',
+    RIPPLE_REVIEWED: 'notifActivityApproved',
 };
 
 // Unique per recipient: the same event can't be recorded twice.
@@ -66,6 +83,12 @@ const keys = {
     commentLike: (commentId, actorId) => `comment_like:${commentId}:${actorId}`,
     review: (postId) => `review:${postId}`,
     medal: (tierId) => `medal:${tierId}`,
+    pledge: (postId, actorId) => `pledge:${postId}:${actorId}`,
+    ripple: (postId) => `ripple:${postId}`,
+    badge: (badgeId) => `badge:${badgeId}`,
+    vouchRequest: (postId) => `vouch_request:${postId}`,
+    vouched: (postId, actorId) => `vouched:${postId}:${actorId}`,
+    rippleReview: (postId) => `ripple_review:${postId}`,
 };
 
 // ---------- recording (always inside the caller's transaction `tx`) ----------
@@ -173,6 +196,46 @@ const postReviewed = async (tx, post) => {
 // reach it again.
 const medalEarned = (tx, userId, tierId) => create(tx, { type: 'MEDAL_EARNED', recipientId: userId, dedupeKey: keys.medal(tierId) });
 
+// Ripple (rippleService). "Aarav pledged to do your beach clean-up too": postId is the
+// pledged post. Cancelling the pledge removes it.
+const pledged = (tx, actorId, post) =>
+    create(tx, { type: 'PLEDGE', recipientId: post.authorId, actorId, postId: post.id, dedupeKey: keys.pledge(post.id, actorId) });
+
+const unpledged = (tx, actorId, post) => removeWhere(tx, { recipientId: post.authorId, dedupeKey: keys.pledge(post.id, actorId) });
+
+// "Aarav did it": an activity inspired by `sourceAuthorId`'s post now counts. postId is
+// the NEW post (the tap opens what they did). Once per inspired post.
+const rippled = (tx, post, sourceAuthorId) =>
+    create(tx, { type: 'RIPPLE', recipientId: sourceAuthorId, actorId: post.authorId, postId: post.id, dedupeKey: keys.ripple(post.id) });
+
+// A ripple badge (config/ripple.js), once per badge: badges are kept once earned.
+const badgeEarned = (tx, userId, badgeId) => create(tx, { type: 'BADGE_EARNED', recipientId: userId, dedupeKey: keys.badge(badgeId) });
+
+// Vouching (rippleService). "Aarav says you were with them": to a companion named on
+// an inspired post (actor = its author). Answering removes it.
+const vouchRequested = (tx, post, companionId) =>
+    create(tx, { type: 'VOUCH_REQUEST', recipientId: companionId, actorId: post.authorId, postId: post.id, dedupeKey: keys.vouchRequest(post.id) });
+
+const vouchAnswered = (tx, companionId, postId) => removeWhere(tx, { recipientId: companionId, dedupeKey: keys.vouchRequest(postId) });
+
+// "Meera vouched for your activity": a companion confirmed. A decline is not announced.
+const vouched = (tx, companionId, post) =>
+    create(tx, { type: 'VOUCHED', recipientId: post.authorId, actorId: companionId, postId: post.id, dedupeKey: keys.vouched(post.id, companionId) });
+
+// A reviewer verified or rejected the post's inspiration link. Like postReviewed, a
+// second review replaces the first and is unread again; the message follows the
+// post's current rippleStatus.
+const rippleReviewed = async (tx, post) => {
+    const dedupeKey = keys.rippleReview(post.id);
+    const row = await tx.notification.upsert({
+        where: { recipientId_dedupeKey: { recipientId: post.authorId, dedupeKey } },
+        create: { type: 'RIPPLE_REVIEWED', recipientId: post.authorId, postId: post.id, dedupeKey },
+        update: { readAt: null, createdAt: new Date() },
+        select: { id: true },
+    });
+    return row.id;
+};
+
 // ---------- reading ----------
 
 const INCLUDE = {
@@ -182,6 +245,8 @@ const INCLUDE = {
             id: true,
             title: true,
             rejectionReason: true,
+            rippleStatus: true,
+            rippleRejectionReason: true,
             media: { orderBy: { position: 'asc' }, take: 1, select: { type: true, key: true, thumbnailKey: true } },
         },
     },
@@ -224,14 +289,31 @@ const messageFor = (n) => {
             const tier = tierById(n.dedupeKey.slice('medal:'.length));
             return tier ? `You earned the ${tier.label} for ${tier.activities} approved activities.` : 'You earned a medal.';
         }
+        case 'PLEDGE':
+            return `${name} was inspired by your activity "${title}" and pledged to do it too.`;
+        case 'RIPPLE':
+            return `${name} did it! Their activity "${title}" was inspired by yours.`;
+        case 'BADGE_EARNED': {
+            const badge = badgeById(n.dedupeKey.slice('badge:'.length));
+            return badge ? `You earned the ${badge.label} ripple badge: ${badge.description}.` : 'You earned a ripple badge.';
+        }
+        case 'VOUCH_REQUEST':
+            return `${name} says you were with them for "${title}". Can you vouch for it?`;
+        case 'VOUCHED':
+            return `${name} vouched for your activity "${title}": they were there with you.`;
+        case 'RIPPLE_REVIEWED':
+            return n.post?.rippleStatus === 'REJECTED'
+                ? `A reviewer couldn't confirm what inspired "${title}"${n.post.rippleRejectionReason ? `: ${n.post.rippleRejectionReason}` : '.'}`
+                : `A reviewer confirmed "${title}". It now counts in the ripple.`;
         default:
             return 'You have a new notification.';
     }
 };
 
 // Where tapping it goes: the post if there is one, otherwise the person (a medal opens
-// your own profile, where the Impact tab is).
+// your own profile, where the Impact tab is; a ripple badge opens your ripple).
 const urlFor = (n) => {
+    if (n.type === 'BADGE_EARNED') return `${APP_SCHEME}://ripple/${n.recipientId}`;
     if (n.type === 'MEDAL_EARNED') return `${APP_SCHEME}://user/${n.recipientId}`;
     if (n.postId) return `${APP_SCHEME}://post/${n.postId}`;
     if (n.actorId) return `${APP_SCHEME}://user/${n.actorId}`;
@@ -244,10 +326,19 @@ const thumbnailUrl = (post) => {
     return storage.urlFor(first.type === 'VIDEO' ? first.thumbnailKey : first.key);
 };
 
+// The badge a BADGE_EARNED row is about (its id lives in the dedupe key), so the app
+// can celebrate it by name without parsing the message.
+const badgeOf = (n) => {
+    if (n.type !== 'BADGE_EARNED') return undefined;
+    const badge = badgeById(n.dedupeKey.slice('badge:'.length));
+    return badge ? { id: badge.id, label: badge.label, description: badge.description, hidden: Boolean(badge.hidden) } : null;
+};
+
 const toNotification = (n, viewerId, rel) => ({
     id: n.id,
     type: TYPE_NAMES[n.type],
     message: messageFor(n),
+    ...(n.type === 'BADGE_EARNED' && { badge: badgeOf(n) }),
     actor: n.actor ? toCard(n.actor, viewerId, rel) : null,
     post: n.post ? { id: n.post.id, title: n.post.title, thumbnailUrl: thumbnailUrl(n.post) } : null,
     comment: n.comment ? { id: n.comment.id, text: n.comment.text } : null,
@@ -276,6 +367,14 @@ const listNotifications = async (userId, { cursor, limit }) => {
 };
 
 const unreadCount = async (userId) => ({ unreadCount: await countUnread(userId) });
+
+// One notification: what a phone woken by FCM fetches to build its banner (D77).
+const getNotification = async (userId, id) => {
+    const n = await prisma.notification.findFirst({ where: { AND: [visibleWhere(userId), { id }] }, include: INCLUDE });
+    if (!n) throw notFound();
+    const [rel, unread] = await Promise.all([relationsFor(userId, n.actorId ? [n.actorId] : []), countUnread(userId)]);
+    return { notification: toNotification(n, userId, rel), unreadCount: unread };
+};
 
 // Read/delete also update the user's OTHER devices (phone + tablet stay in step).
 const markRead = async (userId, id) => {
@@ -364,23 +463,34 @@ const alertFor = async (n, prefs) => {
     };
 };
 
+// Two channels (D77):
+// - WebSocket: the full notification to every connected device (list, badge, banner).
+// - FCM display message: only when a banner is due; Android shows it itself. Sent even
+//   if a socket looks connected, because Android freezes a backgrounded app's network
+//   while the server still holds its socket (up to a heartbeat, ~60 s), and those frames
+//   are lost. Both carry the notification id, and the app shows each id once.
 const sendOne = async (id) => {
     const n = await prisma.notification.findUnique({ where: { id }, include: { ...INCLUDE, recipient: { select: { status: true } } } });
     // Gone already (a quick unlike), or the recipient's account isn't active.
     if (!n || n.recipient.status !== 'ACTIVE') return;
-    // Nobody online: the app picks it up from GET /notifications when it opens.
-    if (realtime.connectedDevices(n.recipientId) === 0) return;
+    const online = realtime.connectedDevices(n.recipientId) > 0;
+    // Nobody online and no push: the app picks it up from GET /notifications when it opens.
+    if (!online && !push.isEnabled()) return;
 
-    const [prefs, rel, unread] = await Promise.all([
-        getSettings(n.recipientId),
-        relationsFor(n.recipientId, n.actorId ? [n.actorId] : []),
-        countUnread(n.recipientId),
-    ]);
+    const prefs = await getSettings(n.recipientId);
+    const alert = await alertFor(n, prefs);
+    if (alert) {
+        const payload = { notificationId: n.id, body: messageFor(n), url: urlFor(n), channelId: alert.channelId };
+        track(push.notify(n.recipientId, payload), `push for ${n.id}`);
+    }
+    if (!online) return;
+
+    const [rel, unread] = await Promise.all([relationsFor(n.recipientId, n.actorId ? [n.actorId] : []), countUnread(n.recipientId)]);
     realtime.sendToUser(n.recipientId, {
         type: 'notification',
         notification: toNotification(n, n.recipientId, rel),
         unreadCount: unread,
-        alert: await alertFor(n, prefs),
+        alert,
     });
 };
 
@@ -408,7 +518,10 @@ const syncCount = (userIds) => {
     for (const userId of new Set([userIds].flat().filter(Boolean))) track(sendCount(userId), `unread count for ${userId}`);
 };
 
-const settle = () => Promise.all([...inFlight]);
+// Loops because a send can start another tracked job (the FCM wake-up).
+const settle = async () => {
+    while (inFlight.size > 0) await Promise.all([...inFlight]);
+};
 
 // "Send me a test notification": goes to every connected device whatever the
 // settings, so a developer can check the app's socket + banner code.
@@ -435,9 +548,18 @@ module.exports = {
     commentUnliked,
     postReviewed,
     medalEarned,
+    pledged,
+    unpledged,
+    rippled,
+    badgeEarned,
+    vouchRequested,
+    vouchAnswered,
+    vouched,
+    rippleReviewed,
     recipientsOf,
     // reading
     listNotifications,
+    getNotification,
     unreadCount,
     markRead,
     markAllRead,

@@ -297,12 +297,29 @@ an action (follow, like, comment, comment like, accept request)
     notificationService.deliver(ids)           after commit; background (inFlight set)
       sendOne(id)
         notification gone? recipient not ACTIVE? → stop
-        recipient has no connected device?       → stop (the app catches up from the list on open)
+        no connected device AND push off?        → stop (the app catches up from the list on open)
         alert = settings: pauseAll / 'off' / false → null
                           'following' → recipient follows actor? else null
                           same (recipient, dedupe_key) alerted < 1 h ago → null
                           quiet hours → { sound: false, vibrate: false, channelId: 'silent' }
-        realtime.sendToUser(recipient, { type: 'notification', notification, unreadCount, alert })
+        alert?  → pushService.notify(recipient, { notificationId, body: messageFor(n), url: urlFor(n), channelId })
+                    push_tokens of LIVE sessions (user ACTIVE) → FCM display message, HIGH, TTL 24 h:
+                      notification.body, android.notification { channel_id, tag: id, color },
+                      data { type:'notification', notificationId, url, tag }          (D77, tracked too)
+                    FCM 404/UNREGISTERED/"registration token" 400 → delete that token
+                    429/5xx/network → one retry after 1 s; any error → logged, never thrown
+        connected? → realtime.sendToUser(recipient, { type: 'notification', notification, unreadCount, alert })
+
+the phone (MyVolApp)
+  app open:    socket → presentAlert → local notification (identifier = id); FCM copy → handler hides it
+  background:  Android shows the FCM copy; a late socket frame is skipped (token registered + not active)
+  killed:      Android shows the FCM copy
+  tap → config/linking.js: subscribe (running) / getInitialURL (launched a killed app) → data.url screen
+
+PUT    /notifications/push-token {token, platform}  delete rows with this token OR this session → insert
+                                                    → { registered, enabled }
+DELETE /notifications/push-token                    this session's row
+GET    /notifications/:id                           same visibility as the list → { notification, unreadCount }
     notificationService.syncCount(userIds)     → { type: 'unread_count', unreadCount } to their devices
 
 lib/realtime.js  (server.js attaches it to the HTTP server; same port)
@@ -371,6 +388,49 @@ approval paths, inside their own transaction:
   moderationService.reviewPost   (status → APPROVED)       → impact.checkMedal(tx, author)
     checkMedal: count == a tier's threshold → notifications.medalEarned (dedupe medal:<tier>)
   → deliver() after commit (banner setting notifActivityApproved; url myvolapp://user/<me>)
+```
+
+## 4g2. Ripple (`/posts/:id/pledge`, `/posts/:id/ripple`, `/posts/:id/vouch`, `/users/:user/ripple[/tree]`, `/users/me/pledges`, `/users/me/vouch-requests`, `/admin/ripple`)
+
+```
+rippleService (config/ripple.js = badges, PLEDGE_DAYS 60, MAX_DEPTH 20, MAX_TREE_NODES 300)
+  descendants(rootWhere)  WITH RECURSIVE tree: posts whose inspired_by_post_id is a root post (s), then
+                          their children, … ; every node COUNTED = APPROVED + ripple_status VERIFIED + ACTIVE
+                          author (else the branch stops); each node carries its root_id
+  statsBelow              min(depth) per post → people = count(DISTINCT author ≠ owner), depth = max, cities,
+                          hometown (depth ≥ 2, city = owner's profiles.city), bestPost (max people per root_id)
+  statsFor(user)          roots = the user's APPROVED posts → awardBadges (all 5 numbers);
+                          responses get publicStats (people, depth, cities): profile.ripple, GET …/ripple, trees
+  badgesFor               hidden + unearned → { id, hidden, hint } only; next = first visible unearned
+  treeOf                  same walk, LIMIT 301 → nodes; visibleTo(viewer) decides hidden: true per node
+
+POST /posts { …, inspiredByPostId } → postService.createPost
+  ripple.checkInspiration   findVisiblePost(author, source) (else 400 INSPIRATION_NOT_FOUND); own → OWN_INSPIRATION
+  ripple.checkCompanions    resolve ids/usernames (ACTIVE) → chainAuthors(source) (WITH RECURSIVE up)
+                            → per companion: blocked/missing → NOT_FOUND, self, in chain, whoCanTag, canViewActivities
+  [tx] post.create(inspiredById, ripple_status PENDING) → hashtags → ripple.fulfillPledge
+       → POST_AUTO_APPROVE → impact.checkMedal
+       → ripple.addCompanions: post_companions rows + notifications.vouchRequested each
+POST /posts/:id/vouch { answer } → findVisiblePost(companion) → row? (else 404 VOUCH_NOT_FOUND)
+  [tx] updateMany(PENDING → CONFIRMED|DECLINED) (0 rows → 409 VOUCH_ANSWERED) → vouchAnswered (request removed)
+       confirm → notifications.vouched → post.updateMany(PENDING → VERIFIED, verified_by) → countIfReady
+POST /posts/:id/ripple/review-request → author only → PENDING only → ripple_review_requested_at (first date kept)
+moderationService.reviewRipple (POST /admin/posts/:id/ripple/verify|reject)
+  [tx] ripple.review: rippleStatus + reason → rippleReviewed (upsert) → VERIFIED → countIfReady; log action
+moderationService.reviewPost (→ APPROVED, newly) → … + ripple.countIfReady(tx, post.id)
+  countIfReady: APPROVED + VERIFIED + author ACTIVE → onCounted (whichever of approval/verification comes second)
+  onCounted: notifications.rippled → source author ("X did it", dedupe ripple:<post>)
+             WITH RECURSIVE up: every author above the post → awardBadges(each)
+             awardBadges: statsFor → each badge it meets → user_badges createMany(skipDuplicates)
+                          inserted → notifications.badgeEarned (dedupe badge:<id>; the list adds
+                          badge {id,label,description,hidden} read from the key, url myvolapp://ripple/<you>)
+  → deliver() after commit
+
+POST /posts/:id/pledge → findVisiblePost; own → 400 OWN_POST
+  [tx] delete an expired, unfulfilled row → createMany(skipDuplicates) → new → notifications.pledged
+DELETE /posts/:id/pledge → fulfilled → 409 PLEDGE_FULFILLED; else delete + notifications.unpledged (syncCount)
+toPosts → ripple.postFacts(viewer, posts): 5 queries per page → inspiredBy, inspiredCount, pledgesCount, myPledge,
+          rippleStatus, companions (author: all; others: confirmed), myVouch, reviewRequestedAt (author)
 ```
 
 ## 4h. Settings and the rules they drive (`/api/v1/settings`)
@@ -486,6 +546,7 @@ jobs/authCleanup.runAuthCleanup
     delete notifications  older than NOTIFICATION_RETENTION_DAYS (90)
     delete stories        expired, or by purged users                       (story_views cascade)
     recount hashtags.posts_count; delete unused hashtags older than 1 d
+    delete pledges        unfulfilled and older than PLEDGE_DAYS (60)
     (before purging users: subtract their follows from other users' counters, note which
      posts/comments/stories they liked, saved, commented on or viewed; after the delete, recount
      those counters; after commit: delete their avatar, post and story files)
@@ -514,7 +575,12 @@ users ─┬─< notifications (recipient_id; actor_id, post_id, comment_id all 
        └─< moderation_actions (moderator_id SET NULL; target_type + target_id, no FK: audit log)
 posts ─< post_hashtags >─ hashtags (name unique, posts_count)
 users ─┬─< stories (expires_at, views_count) ─< story_views (story_id, viewer_id)
-       └─< suggestion_dismissals (user_id, dismissed_id)
+       ├─< suggestion_dismissals (user_id, dismissed_id)
+       ├─< pledges (user_id, post_id; fulfilled_post_id SET NULL)   "I'll do this too"
+       └─< user_badges (user_id, badge_id, earned_at)               ripple badges, kept once earned
+posts.inspired_by_post_id → posts (SET NULL): the ripple graph (always to an older post, no loops).
+posts.ripple_status (PENDING|VERIFIED|REJECTED), ripple_verified_by_id → users (SET NULL).
+post_companions (post_id, user_id, status PENDING|CONFIRMED|DECLINED) → posts, users (CASCADE).
 users.activity_visibility ('everyone'|'followers'|'onlyMe', CHECK) and users.show_location are settings
 stored as columns; posts.featured_at = staff pick; comments.is_offensive = matched the word list;
 reports.story_id (SET NULL) for type STORY.

@@ -1,6 +1,7 @@
 const env = require('../config/env');
 const prisma = require('../lib/prisma');
 const storage = require('../lib/storage');
+const { PLEDGE_DAYS } = require('../config/ripple');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REVOKED_SESSION_RETENTION_DAYS = 30;
@@ -108,6 +109,8 @@ const purgeDatabase = () =>
                       GROUP BY h2.id) c
                 WHERE h.id = c.id AND h.posts_count <> c.n`;
             const hashtags = await tx.hashtag.deleteMany({ where: { postsCount: 0, createdAt: { lt: daysAgo(1) } } });
+            // "I'll do this too" pledges that ran out without the activity being posted.
+            const pledges = await tx.pledge.deleteMany({ where: { fulfilledPostId: null, createdAt: { lt: daysAgo(PLEDGE_DAYS) } } });
 
             return {
                 purgedUsers: users.count,
@@ -119,6 +122,7 @@ const purgeDatabase = () =>
                 notifications: notifications.count,
                 hashtags: hashtags.count,
                 stories: stories.count,
+                pledges: pledges.count,
                 fileKeys: [
                     ...avatars.map((a) => a.avatarKey),
                     ...[...postMedia, ...storyFiles].flatMap((m) => [m.key, m.thumbnailKey].filter(Boolean)),

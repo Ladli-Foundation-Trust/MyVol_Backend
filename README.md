@@ -348,14 +348,30 @@ To use the foundation's own media, replace the files and keep their names.
 
 ## Notifications (live over our own WebSocket)
 
-No Firebase, no Expo push service, no third party: notifications reach the app over a WebSocket on this
-server (`src/lib/realtime.js`, built on the `ws` protocol library). The app shows them as phone
-notifications itself (local notifications).
+Notifications reach the app over a WebSocket on this server (`src/lib/realtime.js`, built on the `ws`
+protocol library). The app shows them as phone notifications itself (local notifications).
 
-**What this means:** a notification arrives instantly while the app is open, or for a short while after
-it goes to the background. When the app is closed (or Android has suspended it), nothing arrives; when it
-opens again it reconnects, gets the unread count in `ready`, and reloads the list. Waking a closed app is
-only possible through Google's FCM (Android) or Apple's APNs (iOS); that would be a later, optional step.
+**Closed app (decision D77):** Android won't let a closed or frozen app hold a socket, so when a banner is
+due the server also sends FCM a **display message**: the notification's text, the channel the user's
+settings picked (sound/vibrate/quiet hours), `tag` = the notification id and the deep link in `data.url`.
+Android shows it by itself, even when the phone maker's battery manager freezes the app (a data-only
+"wake the app" design was tried first and failed on a Motorola for exactly that reason; see D77). Setup:
+put the Firebase service-account key at
+`secrets/firebase-service-account.json` (git-ignored) and set `FIREBASE_SERVICE_ACCOUNT_PATH` in `.env`, or
+on a host that only takes env vars put the key's JSON (or its base64) in `FIREBASE_SERVICE_ACCOUNT_JSON`.
+Neither means push off (the socket still works). Startup prints `Closed-app notifications (FCM): on (Firebase
+project …)` or `off`. The app registers its token with `PUT /notifications/push-token` after login.
+Android only for now.
+
+| App state | Delivered by | Shown by |
+|---|---|---|
+| Open (foreground) | WebSocket, instantly (FCM too) | the app (local notification); the FCM copy is hidden |
+| Background | FCM (the socket too, if Android hasn't frozen it yet) | Android; the app skips the socket copy |
+| Killed (swiped away) | FCM | Android |
+| Force-stopped (Settings → Force stop) | nothing: Android blocks FCM until the user opens the app | – |
+
+Each id shows once: the app's local notifications use the id as their identifier and FCM as its tag.
+A tap opens `data.url` in every state (`MyVolApp/src/config/linking.js`).
 
 ### REST
 
@@ -369,6 +385,9 @@ Base `/api/v1`. **Every route needs `Authorization: Bearer`.**
 | POST | `/notifications/read-all` | `{ before? }` (ISO time, optional) | Only up to `before` if given, so one arriving meanwhile stays unread |
 | DELETE | `/notifications/:id` | – | → `{ unreadCount }` |
 | POST | `/notifications/test` | – | Sends a `test` event to your connected devices → `{ devices }` |
+| GET | `/notifications/:id` | – | One notification → `{ notification, unreadCount }` |
+| PUT | `/notifications/push-token` | `{ token, platform: 'android' \| 'ios' }` | This login's FCM token → `{ registered, enabled }`. One per session; a token on another session moves here |
+| DELETE | `/notifications/push-token` | – | This session's token → `{ removed }` (logout also stops pushes) |
 | GET | `/settings` | – | → `{ settings }`: all 45 keys of the app's settings, defaults filled in (see "Settings") |
 | PATCH | `/settings` | any subset of the keys | Merged into what is stored; unknown keys/values → 400 |
 
@@ -425,9 +444,12 @@ A logged-out or revoked session is disconnected within 30 s.
    logout. On `ready` set the badge; refetch `GET /notifications` when the Activity tab opens.
 2. On `notification`: update the list and badge; if `alert` is set, show it with
    `Notifications.scheduleNotificationAsync({ content: { title: 'MyVolApp', body: message, data: { url } }, trigger: null })`
-   (`expo-notifications`, local only: needs no Firebase, no EAS project, no push token). On Android create
-   the four channels once at startup with `setNotificationChannelAsync`.
-3. On a banner tap, open `data.url` (the app's linking config already handles `myvolapp://post/…` and `myvolapp://user/…`).
+   (`expo-notifications`). On Android create the four channels once at startup with `setNotificationChannelAsync`.
+   After login, `getDevicePushTokenAsync()` → `PUT /notifications/push-token` (`src/notifications/pushRegistration.js`);
+   when the app isn't in the foreground, Android shows FCM's copy itself.
+3. On a banner tap, open `data.url` through React Navigation's linking config (`src/config/linking.js`:
+   `subscribe` for taps while running, `getInitialURL` for the tap that launched a killed app). Handles
+   `myvolapp://post/…`, `/user/…`, `/ripple/…` and `/notifications` (the inbox). No website is needed.
 
 ### Try it without the app
 
@@ -463,6 +485,82 @@ The app's screens map onto it like this: Home's "N activities away from…" bann
 The tiers live in `src/config/medals.js`, so the app can stop hard-coding `MEDAL_TIERS`.
 Medals follow the current count: deleting a post or having it rejected can take one away again. Reaching
 a tier sends a `medal` notification once.
+
+## Ripple: pledges, inspired posts, ripple badges
+
+*"Instagram shows what you posted. MyVolApp shows who you inspired."* A post can name the post that
+inspired it (`inspiredByPostId` on create). Your **ripple** is everyone downstream of your posts: the
+people you inspired, the people they inspired, and so on. Rules: only **approved** posts by **active**
+accounts whose link is **verified** count (one that doesn't also cuts off everything below it);
+**people, not posts** (ten posts by one volunteer are one person); your own posts never count in your
+own ripple. Badges live in `src/config/ripple.js` and are **kept once earned**, unlike medals.
+Three of them are **secret** (`hidden: true`): Six Degrees (a chain 6 deep), Full Circle (someone 2+
+levels down posted in your profile city) and Spotlight (one post inspired 10 volunteers). Until earned
+they show only a `hint`, and they are never `next`. Decisions: D67–D76.
+
+**Vouching** ("who was with you"): a linked post starts `rippleStatus: "pending"`. It counts once one of
+the **companions** named on it confirms they were there, or a reviewer verifies it (the author can ask
+for that when nobody can vouch). A companion can't be anyone up the inspiration chain, since they would
+be vouching for their own ripple.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/api/v1/posts` | New optional field `inspiredByPostId` (JSON or a multipart text field). Must be a post you can see and not your own: 400 `INSPIRATION_NOT_FOUND` / `OWN_INSPIRATION`. Set at creation only. Fulfils your pledge on that post |
+| POST | `/api/v1/posts` | `companions`: up to 5 user ids or usernames (JSON array, or one comma-separated multipart field); only with `inspiredByPostId`. 400 `COMPANION_NOT_FOUND` (also when blocked) / `COMPANION_SELF` / `COMPANION_IN_CHAIN` / `COMPANION_TAGS_OFF` (their `whoCanTag`) / `COMPANION_CANT_SEE` (they couldn't open your post). Each gets a `vouch_request` |
+| POST | `/api/v1/posts/:id/vouch` | `{ "answer": "confirm" \| "decline" }` → `{ vouch, rippleStatus }`. Named companions only (404 `VOUCH_NOT_FOUND`), verified account, final (409 `VOUCH_ANSWERED`). The first confirm verifies a pending link; a reviewer's rejection stands |
+| GET | `/api/v1/users/me/vouch-requests` | Posts waiting for your answer, newest first: `{ requests: [{ post, askedAt }], nextCursor }` |
+| POST | `/api/v1/posts/:id/ripple/review-request` | Author only (else 404): ask a reviewer to confirm the link → `{ rippleStatus, reviewRequestedAt }`. 400 `NOT_INSPIRED`, 409 `RIPPLE_ALREADY_REVIEWED` |
+| GET | `/api/v1/admin/ripple` | REVIEWER/ADMIN: pending links whose author asked (`?all=true` = every pending link), oldest first, each with `source`, `companions` (with answers) and `reviewRequestedAt` |
+| POST | `/api/v1/admin/posts/:id/ripple/verify`, `…/ripple/reject` | `{ note? }` / `{ reason }`. Logged as VERIFY_RIPPLE / REJECT_RIPPLE; the author gets `ripple_reviewed`. 409 `NOT_INSPIRED` |
+| POST / DELETE | `/api/v1/posts/:id/pledge` | "I'll do this too" → `{ pledged, pledgesCount }`. Not on your own post (400 `OWN_POST`). Open for 60 days; pledging an expired one renews it. A fulfilled pledge can't be cancelled (409 `PLEDGE_FULFILLED`) |
+| GET | `/api/v1/users/me/pledges` | Open pledges, newest first: `{ pledges: [{ post, pledgedAt, expiresAt }], nextCursor }` |
+| GET | `/api/v1/users/me/ripple`, `/api/v1/users/:user/ripple` | Numbers + every badge + the next one. Same privacy as impact (`showImpactStats`, blocks) |
+| GET | `/api/v1/users/me/ripple/tree`, `/api/v1/users/:user/ripple/tree` | `?depth=1..5` (default 3). The ripple as nodes, level by level, max 300 (`truncated`) |
+| GET | `/api/v1/posts/:id/ripple` | `?depth=1..5`. What one activity set in motion |
+
+Every post now also carries:
+
+```json
+{ "inspiredBy": { "hidden": false, "id": "…", "title": "Lake clean-up", "author": { "…card": "" } },
+  "inspiredCount": 3, "pledgesCount": 7, "myPledge": "open",
+  "rippleStatus": "verified", "companions": [{ "user": { "…card": "" }, "status": "confirmed" }],
+  "myVouch": null, "reviewRequestedAt": null }
+```
+
+`rippleStatus` = `null` (no link) | `"pending"` | `"verified"` | `"rejected"`. `companions`: the author sees
+everyone they named with `pending | confirmed | declined`; everyone else sees only those who confirmed.
+`myVouch` = your own answer when you were named. `reviewRequestedAt` is shown to the author only.
+
+`inspiredBy` is `null` (no link) or `{ "hidden": true }` when you can't see the source (private, blocked).
+`inspiredCount` = people this post directly inspired. `myPledge` = `null | "open" | "fulfilled"`.
+`profile.ripple` = `{ people, depth, cities, badges: ["spark"] }` (`null` when impact stats are hidden).
+
+```json
+{ "ripple": {
+    "people": 7, "depth": 3, "cities": 2,
+    "badges": [{ "id": "spark", "hidden": false, "label": "Spark", "description": "Inspired your first volunteer",
+                 "requires": { "people": 1 }, "earned": true, "earnedAt": "2026-11-13T…" },
+               "…wave, tide, tsunami, city_hopper",
+               { "id": "full_circle", "hidden": true, "hint": "Somewhere close to home", "label": null,
+                 "description": null, "requires": null, "earned": false, "earnedAt": null },
+               "…six_degrees, spotlight"],
+    "next": { "id": "tide", "label": "Tide", "remaining": { "people": 13, "depth": 0 } } } }
+```
+
+Responses only ever show `people`, `depth` and `cities`; the numbers behind the secret badges
+(`hometown`, `bestPost`) stay on the server.
+
+A tree node is `{ postId, parentPostId, depth, hidden, post: { id, title, category, thumbnailUrl, createdAt }, author }`.
+Depth-1 nodes hang from the root (`parentPostId: null`); a post the viewer can't see keeps its place as
+`{ hidden: true, post: null, author: null }`, so the count stays honest without showing who.
+
+Notifications: `pledge` (someone pledged on your post), `ripple` ("Aarav did it", opens their post;
+once per inspired post, sent when the link is verified), `badge` (carries `badge: { id, label,
+description, hidden }` so the app can celebrate it; `url` is `myvolapp://ripple/<you>`), `vouch_request`
+(you were named; removed when you answer), `vouched` (a companion confirmed; declines are silent),
+`ripple_reviewed` (a reviewer verified or rejected your link). Banners: pledge/ripple/vouched follow
+`notifLikes`, vouch_request follows `notifMentions`, badges and ripple_reviewed follow
+`notifActivityApproved`. Expired unfulfilled pledges are deleted by the cleanup job.
 
 ## Block & mute
 
@@ -603,13 +701,28 @@ them with their files. Reports: `POST /reports` with `type: 'story'`; staff remo
 - `POST /api/v1/users/me/export` with `{ password }` ("Download your information"): the whole account as a
   JSON file (`Content-Disposition: attachment`): account, profile, settings, posts with media URLs,
   comments, likes, saves, followers, following, requests, blocks, mutes, stories, notifications, reports
-  made, active sessions and the last 500 login events. Never password/token/code hashes or who reported
+  made, active sessions, the last 500 login events, pledges, ripple badges and vouches. Never password/token/code hashes or who reported
   you. Wrong or missing password → 403 `INVALID_PASSWORD` (Google-only accounts: a sign-in within 10 min,
   else `REAUTH_REQUIRED`). 5 an hour. Audited as `data_exported`.
 - **Login alerts**: a sign-in (password, phone or Google) from a device the account hasn't used before (a
   new `deviceName` + user agent pair, and not the account's first session) is audited as
   `new_device_login` and, with `loginAlerts` on (default), emailed ("New sign-in to your MyVolApp
   account", printed to the console locally). Phone-only accounts have no email to send it to.
+
+## Link previews (public, for myvol.org)
+
+Share links are `https://myvol.org/post/<id>`, `/user/<id>` and `/ripple/<id>`. The website (`ladli/myvol-web`)
+renders them and their link cards from these routes. **No login**; they return only what a logged-out stranger
+may see (decision D78).
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/previews/posts/:postId` | `{ post: { id, title, description (≤300), category, location, beneficiaries, hours, likesCount, commentsCount, isVideo, image: { url, width, height } \| null, createdAt }, author: { id, username, name, avatarUrl } }`. Only approved posts of public accounts with activities for everyone; anything else → 404 `POST_NOT_FOUND`. |
+| GET | `/previews/users/:user` | id or username. Private → `{ user: { id, username, name, avatarUrl, isPrivate: true } }`; public adds `bio, followersCount, followingCount, postsCount` (`null` if activities aren't for everyone). |
+| GET | `/previews/ripple/:user` | `{ user, ripple: { people, depth, cities, badges } \| null }` (`null` = impact stats hidden). |
+
+`Cache-Control: public, max-age=300`. In production set `PUBLIC_BASE_URL=https://api.myvol.org` so the
+image URLs work outside your network.
 
 ## Prisma 7 notes
 

@@ -1,6 +1,7 @@
 const { z } = require('zod');
 const env = require('../config/env');
 const { listQuery } = require('./userValidators');
+const { MAX_COMPANIONS } = require('../config/ripple');
 
 // Matches the app (MyVolApp src/data/filterOptions.js CATEGORY_FILTERS, ActivityForm limits).
 const CATEGORIES = [
@@ -51,12 +52,49 @@ const postFields = {
 
 // Sent as multipart/form-data (with photos in "media") or as JSON (text-only post).
 // Only title and category are required, as in the app's form.
+// "Who was with you" on an inspired post: user ids or usernames. Multipart sends one
+// field, so a comma-separated string (or a JSON array string) is accepted too.
+const companionList = z.preprocess(
+    (v) => {
+        if (typeof v !== 'string') return v;
+        const text = v.trim();
+        if (text.startsWith('[')) {
+            try {
+                return JSON.parse(text);
+            } catch {
+                return v;
+            }
+        }
+        return text ? text.split(',') : [];
+    },
+    z
+        .array(z.string().trim().min(1, 'is empty').max(64, 'is too long'), { error: 'must be a list of usernames or user ids' })
+        .max(MAX_COMPANIONS, `can name at most ${MAX_COMPANIONS} people`),
+);
+
 const createPost = z.strictObject({
     ...postFields,
     description: postFields.description.optional(),
     location: postFields.location.optional(),
     beneficiaries: postFields.beneficiaries.default(0),
     hours: postFields.hours.default(0),
+    // Ripple: the post that inspired this activity (set at creation only, never edited).
+    inspiredByPostId: z.uuid('is not a valid post id').optional(),
+    // People who were there and can vouch that it happened (inspired posts only).
+    companions: companionList.optional(),
+}).refine((p) => !p.companions?.length || p.inspiredByPostId, {
+    path: ['companions'],
+    message: 'can only be named on an activity inspired by another post',
+});
+
+// POST /posts/:id/vouch: a companion's answer to "were you there?".
+const vouch = z.strictObject({
+    answer: z.enum(['confirm', 'decline'], { error: 'must be confirm or decline' }),
+});
+
+// GET …/ripple/tree, GET /posts/:id/ripple: how many levels to return.
+const rippleTreeQuery = z.object({
+    depth: z.coerce.number().int().min(1).max(5).default(3),
 });
 
 const updatePost = z
@@ -119,4 +157,6 @@ module.exports = {
     trendingQuery,
     commentListQuery,
     recordView,
+    rippleTreeQuery,
+    vouch,
 };

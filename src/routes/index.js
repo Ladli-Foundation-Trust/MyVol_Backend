@@ -15,5 +15,7 @@ router.use('/search', searchRouter);
 router.use('/hashtags', hashtagRouter);
 router.use('/reports', require('./reportRoutes'));
 router.use('/admin', require('./adminRoutes'));
+// Public link previews for the website (no login).
+router.use('/previews', require('./previewRoutes'));
 
 module.exports = router;

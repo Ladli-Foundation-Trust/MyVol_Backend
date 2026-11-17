@@ -24,6 +24,7 @@ const start = async () => {
     const server = app.listen(env.PORT, () => {
         console.log(`MyVolApp API on http://localhost:${env.PORT}/api/v1 (${env.NODE_ENV})`);
         console.log(`Live notifications on ws://localhost:${env.PORT}${realtime.PATH}`);
+        console.log(`Closed-app notifications (FCM): ${require('./src/services/pushService').describe()}`);
     });
     // The WebSocket shares the HTTP port; 'ready' tells a new connection its badge count.
     const live = realtime.attach(server, { onReady: (user) => notifications.unreadCount(user.id) });

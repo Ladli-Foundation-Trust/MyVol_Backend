@@ -36,6 +36,15 @@ router.delete('/:postId/save', limits.engagementLimiter, post, p.unsave);
 router.post('/:postId/share', limits.engagementLimiter, post, p.share);
 router.post('/:postId/view', limits.engagementLimiter, post, validate({ body: schemas.recordView }), p.view);
 
+// Ripple: "I'll do this too", and the tree of what this activity inspired.
+router.post('/:postId/pledge', limits.engagementLimiter, post, p.pledge);
+router.delete('/:postId/pledge', limits.engagementLimiter, post, p.unpledge);
+router.get('/:postId/ripple', post, validate({ query: schemas.rippleTreeQuery }), p.ripple);
+// Vouching: a companion answers "were you there?" (a verified account, like publishing);
+// the author asks a reviewer when nobody can vouch.
+router.post('/:postId/vouch', requireVerified, limits.engagementLimiter, post, validate({ body: schemas.vouch }), p.vouch);
+router.post('/:postId/ripple/review-request', limits.engagementLimiter, post, p.requestRippleReview);
+
 router.get('/:postId/comments', post, validate({ query: schemas.commentListQuery }), p.comments);
 router.post('/:postId/comments', requireVerified, limits.commentLimiter, post, validate({ body: schemas.addComment }), p.addComment);
 

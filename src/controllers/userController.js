@@ -2,6 +2,7 @@ const profiles = require('../services/profileService');
 const follows = require('../services/followService');
 const blocks = require('../services/blockService');
 const impact = require('../services/impactService');
+const ripple = require('../services/rippleService');
 const stories = require('../services/storyService');
 const suggestions = require('../services/suggestionService');
 const exporter = require('../services/exportService');
@@ -59,6 +60,15 @@ exports.unfollow = async (req, res) => ok(res, await follows.unfollow(req.user.i
 
 exports.myImpact = async (req, res) => ok(res, await impact.getMyImpact(req.user.id));
 exports.impact = async (req, res) => ok(res, await impact.getImpact(req.user.id, req.params.user));
+
+// ---------- ripple ----------
+
+exports.myRipple = async (req, res) => ok(res, await ripple.getRipple(req.user.id, req.user.id));
+exports.ripple = async (req, res) => ok(res, await ripple.getRipple(req.user.id, req.params.user));
+exports.myRippleTree = async (req, res) => ok(res, await ripple.getRippleTree(req.user.id, req.user.id, req.validatedQuery));
+exports.rippleTree = async (req, res) => ok(res, await ripple.getRippleTree(req.user.id, req.params.user, req.validatedQuery));
+exports.myPledges = async (req, res) => ok(res, await ripple.myPledges(req.user.id, req.validatedQuery));
+exports.myVouchRequests = async (req, res) => ok(res, await ripple.myVouchRequests(req.user.id, req.validatedQuery));
 
 // ---------- block & mute ----------
 
