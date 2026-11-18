@@ -1,5 +1,6 @@
 const env = require('../config/env');
 const authService = require('../services/authService');
+const googleOAuth = require('../lib/googleOAuth');
 const accountService = require('../services/accountService');
 const sessionService = require('../services/sessionService');
 
@@ -53,6 +54,21 @@ exports.login = async (req, res) => {
 exports.google = async (req, res) => {
     const session = await authService.loginWithGoogle(req.body, requestContext(req));
     sendSession(res, session.isNewUser ? 201 : 200, session);
+};
+
+// Browser sign-in (lib/googleOAuth): the app opens this URL in a browser tab.
+exports.googleStart = async (req, res) => {
+    res.redirect(302, googleOAuth.buildAuthUrl(req.validatedQuery));
+};
+
+// Google's redirect (the URI registered in Google Cloud). Sends the browser back to the
+// app with a one-time code, or an error. A bad or expired state has nowhere to go.
+exports.googleCallback = async (req, res) => {
+    const target = await googleOAuth.handleCallback(req.validatedQuery);
+    if (target) return res.redirect(302, target);
+    res.status(400)
+        .type('html')
+        .send('<!doctype html><meta name="viewport" content="width=device-width"><title>Sign-in expired</title><p style="font-family:sans-serif;padding:24px">This sign-in link has expired. Close this page and try again from the app.</p>');
 };
 
 exports.refresh = async (req, res) => {

@@ -805,6 +805,50 @@ production API must set `PUBLIC_BASE_URL=https://api.myvol.org` so image URLs in
 **Tests.** `test/preview.test.js` (privacy matrix: private, followers-only, only-me, unapproved, inactive,
 hidden location, hidden impact). Postman folder 35.
 
+### D79. Explore becomes "discover"; trending hashtags; dead settings retired from the app (2026-11-18)
+**Decision.** Home is the following feed (paged, no longer capped at 6). Explore is discovery: community stats,
+causes with counts, "near you" (`/posts/explore?view=near`), trending tags, suggested volunteers, featured
+(`view=featured`), trending post, then every activity. New `GET /api/v1/hashtags/trending?days=30&limit=12`
+→ `{ days, hashtags: [{ name, recentCount, postsCount }] }`: tags on public activities (approved, active,
+public author with activities for everyone), ranked by uses in the last `days`, then all-time public uses,
+so a quiet month still shows tags. Counts only, so blocks aren't subtracted; each tag page applies the viewer's rule.
+The app no longer shows settings nothing reads (`whoCanMention`, `allowReposts`, `showActivityStatus`,
+`nearbyRadius`, `sensitiveContent`, the three email toggles, reminders/nearby/announcement notifications, and
+the app-only `autoplayVideos`, `dataSaver`, `uploadQuality`, `saveOriginalPhotos`, `language`, `distanceUnit`,
+`captionsByDefault`, `altTextReminders`). `/settings` still accepts and stores them; remove them from
+`settingsService` only together with the Postman bodies that send them.
+**Tests.** `test/search.test.js` ("trending"). Postman folder 25 (2 requests).
+
+### D80. Google sign-in through the browser; real email through AWS SES (2026-11-18)
+**Decision.** Google sign-in runs as a server-side web OAuth flow instead of a native Google SDK:
+`GET /auth/google/start?redirectUri&codeChallenge` → Google → `GET /auth/callback/google` → 302 to
+`myvolapp://oauth/google?code=<ticket>` → `POST /auth/google { googleCode, codeVerifier }`. `lib/googleOAuth.js`.
+- **state** and the **ticket** are AES-256-GCM sealed tokens (`utils/sealed.js`, key = HKDF of
+  JWT_ACCESS_SECRET per purpose), 10 minutes each. The server stores nothing.
+- **state** carries the app redirect (exact match against `GOOGLE_APP_REDIRECT_URIS`, so it is not an open
+  redirect), the PKCE challenge and a **nonce** that must come back inside Google's ID token.
+- The **ticket** holds the verified Google profile and the challenge. Redeeming needs the PKCE verifier,
+  which never leaves the app, so another app that registers `myvolapp://` and catches the redirect gets nothing.
+  The ticket is reusable within its 10 minutes on purpose: a new user answers PROFILE_REQUIRED (birth date,
+  terms) with the same code. Everything after the profile (linking, pre-hijack claim, new account) is the
+  existing `loginWithGoogle` (D11, D13); `idToken` still works for native SDKs.
+- Locally it reuses the Skills Forall "Web application" OAuth client, whose registered redirect URI is
+  `http://localhost:3000/api/v1/auth/callback/google`; on a USB phone `localhost:3000` reaches the PC through
+  `adb reverse`. **Before launch:** create MyVol's own OAuth client (consent screen named MyVol, not Skills
+  Forall) with `https://api.myvol.org/api/v1/auth/callback/google`, and set the three GOOGLE_WEB_* vars.
+
+Email now goes out through **AWS SES** (`SendRawEmail`, the same IAM key and verified sender
+`no-reply@socialinternship.org` as Skills Forall; nodemailer's MailComposer builds the MIME). Code emails got an
+HTML part. Reserved/test domains (`example.com/org/net`, `*.local`, `*.test`, `*.example`, `*.invalid`,
+`localhost`) are printed, never sent: Postman and the seeds would otherwise bounce and hurt the shared SES
+account's reputation. `devOtp` is echoed only when the code was not really emailed, so real inboxes behave
+as in production while Postman keeps working.
+**Why.** No native Google SDK or Firebase Auth in the app (the user builds auth themselves; FCM is used only for notifications, D77), and the backend is not deployed:
+a web client with a localhost redirect is the one Google setup that works on a dev phone today. Sealed
+tokens avoid a table for 10-minute state.
+**Tests.** `test/auth.test.js` "google sign-in through the browser (D80)" and "dev code echo". Postman folder 9
+("Google browser - …", 7 requests; "redeem code" needs a person to sign in at Google first).
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|

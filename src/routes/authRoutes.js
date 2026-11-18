@@ -18,6 +18,9 @@ router.use((req, res, next) => {
 router.post('/signup', limits.signupLimiter, validate({ body: schemas.signup }), auth.signup);
 router.post('/login', limits.loginLimiter, validate({ body: schemas.login }), auth.login);
 router.post('/google', limits.loginLimiter, validate({ body: schemas.google }), auth.google);
+// Browser flow (D80): start → Google → callback → myvolapp://oauth/google?code=… → POST /google
+router.get('/google/start', limits.loginLimiter, validate({ query: schemas.googleStart }), auth.googleStart);
+router.get('/callback/google', limits.loginLimiter, validate({ query: schemas.googleCallback }), auth.googleCallback);
 router.post('/refresh', limits.refreshLimiter, validate({ body: schemas.refresh }), auth.refresh);
 router.post('/logout', limits.refreshLimiter, validate({ body: schemas.refresh }), auth.logout);
 router.get('/username-available', limits.usernameCheckLimiter, validate({ query: schemas.usernameQuery }), auth.usernameAvailable);

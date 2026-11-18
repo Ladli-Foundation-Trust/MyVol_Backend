@@ -24,4 +24,10 @@ const hashtagParams = z.strictObject({
         .pipe(z.string().regex(/^[\p{L}\p{M}\p{N}_]{1,50}$/u, 'is not a valid hashtag')),
 });
 
-module.exports = { userSearch, postSearch, hashtagSearch, hashtagParams };
+// GET /hashtags/trending?days&limit
+const trendingHashtags = z.strictObject({
+    days: z.coerce.number().int().min(1).max(90).default(30),
+    limit: z.coerce.number().int().min(1).max(30).default(12),
+});
+
+module.exports = { userSearch, postSearch, hashtagSearch, hashtagParams, trendingHashtags };

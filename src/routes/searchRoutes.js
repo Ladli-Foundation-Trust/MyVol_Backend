@@ -32,6 +32,12 @@ searchRouter.get('/hashtags', validate({ query: schemas.hashtagSearch }), async 
 const hashtagRouter = express.Router();
 hashtagRouter.use(protect);
 
+// Registered before /:tag/posts. "trending" can't clash with a tag: tags are only
+// reached through /:tag/posts.
+hashtagRouter.get('/trending', validate({ query: schemas.trendingHashtags }), async (req, res) => {
+    ok(res, await search.trendingHashtags(req.validatedQuery));
+});
+
 hashtagRouter.get('/:tag/posts', validate({ params: schemas.hashtagParams, query: listQuery }), async (req, res) => {
     ok(res, await search.hashtagPosts(req.user.id, req.params.tag, req.validatedQuery));
 });

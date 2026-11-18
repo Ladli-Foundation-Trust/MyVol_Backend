@@ -24,6 +24,7 @@ const verifyIdToken = async (idToken) => {
         email: payload.email?.toLowerCase(),
         emailVerified: payload.email_verified === true,
         name: payload.name,
+        nonce: payload.nonce,
     };
 };
 

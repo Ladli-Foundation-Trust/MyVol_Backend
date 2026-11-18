@@ -1,13 +1,14 @@
 const prisma = require('../lib/prisma');
 const env = require('../config/env');
 const google = require('../lib/google');
+const googleOAuth = require('../lib/googleOAuth');
 const AppError = require('../utils/appError');
 const emails = require('../emails/authEmails');
 const audit = require('./auditService');
 const sessions = require('./sessionService');
 const codes = require('./verificationCodeService');
 const { getSettings } = require('./settingsService');
-const { queueMail } = require('../lib/mailer');
+const { queueMail, willDeliver } = require('../lib/mailer');
 const { assertReauthenticated } = require('./reauthService');
 const { usernameCandidates, isReserved } = require('../utils/username');
 const { toE164, isPhoneLike } = require('../utils/phone');
@@ -47,12 +48,16 @@ const pickUsername = async (emailLocalPart) => {
 
 // Local testing only (see EXPOSE_OTP_IN_RESPONSE): lets Postman read the code from the
 // response instead of the console. Spread into results; empty when the flag is off.
-const devOtp = (otp) => (env.EXPOSE_OTP_IN_RESPONSE ? { devOtp: otp } : {});
+// Pass the address an email code went to: once it really goes out (SES/SMTP to a real
+// inbox) the inbox is the only place to read it, as in production. Phone codes (no
+// SMS provider yet) pass nothing and are always echoed while the flag is on.
+const devOtp = (otp, emailedTo) =>
+    env.EXPOSE_OTP_IN_RESPONSE && !(emailedTo && willDeliver(emailedTo)) ? { devOtp: otp } : {};
 
 const sendVerificationCode = async (user) => {
     const otp = await codes.issue(user.id, 'EMAIL_VERIFICATION', { ttlMinutes: env.EMAIL_CODE_TTL_MINUTES });
     queueMail({ to: user.email, ...emails.verifyEmail(otp, env.EMAIL_CODE_TTL_MINUTES) });
-    return devOtp(otp);
+    return devOtp(otp, user.email);
 };
 
 const recordFailedLogin = async (userId, ctx) => {
@@ -182,8 +187,10 @@ const login = async ({ identifier, password }, ctx) => {
     throw new AppError(INVALID_CREDENTIALS, 401, undefined, 'INVALID_CREDENTIALS');
 };
 
-const loginWithGoogle = async ({ idToken, username, dateOfBirth, acceptTerms }, ctx) => {
-    const profile = await google.verifyIdToken(idToken);
+// Two ways in: an ID token from a native Google SDK, or the sealed code from the
+// browser flow (lib/googleOAuth) plus the app's PKCE verifier.
+const loginWithGoogle = async ({ idToken, googleCode, codeVerifier, username, dateOfBirth, acceptTerms }, ctx) => {
+    const profile = idToken ? await google.verifyIdToken(idToken) : googleOAuth.redeemTicket(googleCode, codeVerifier);
     if (!profile.email || !profile.emailVerified) {
         throw new AppError('Your Google account email is not verified', 400, undefined, 'GOOGLE_EMAIL_UNVERIFIED');
     }
@@ -325,7 +332,7 @@ const requestPasswordReset = async ({ email }, ctx) => {
     }
     queueMail({ to: email, ...emails.passwordReset(otp, env.PASSWORD_RESET_TTL_MINUTES) });
     audit.record(EVENTS.PASSWORD_RESET_REQUESTED, { userId: user.id, ctx });
-    return devOtp(otp);
+    return devOtp(otp, email);
 };
 
 const resetPassword = async ({ email, otp, newPassword }, ctx) => {
@@ -396,7 +403,7 @@ const requestEmailChange = async (auth, { newEmail, password }, ctx) => {
     const otp = await codes.issue(user.id, 'EMAIL_CHANGE', { ttlMinutes: env.EMAIL_CODE_TTL_MINUTES, target: newEmail });
     queueMail({ to: newEmail, ...emails.emailChange(otp, env.EMAIL_CODE_TTL_MINUTES) });
     audit.record(EVENTS.EMAIL_CHANGE_REQUESTED, { userId: user.id, ctx });
-    return devOtp(otp);
+    return devOtp(otp, newEmail);
 };
 
 // Step 2: the code from the new inbox swaps the email and signs out other devices.

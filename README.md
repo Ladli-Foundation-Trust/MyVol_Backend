@@ -129,7 +129,9 @@ Base `/api/v1/auth`. How it works: [flow.md](flow.md). Why it works that way: [d
 |---|---|---|---|
 | POST | `/signup` | – | `name, email, username, password, dateOfBirth (YYYY-MM-DD), acceptTerms: true, deviceName?` |
 | POST | `/login` | – | `identifier` (email, username or phone), `password, deviceName?` |
-| POST | `/google` | – | `idToken, deviceName?` + for new users `dateOfBirth, acceptTerms, username?` |
+| POST | `/google` | – | `idToken` **or** `googleCode, codeVerifier`; `deviceName?` + for new users `dateOfBirth, acceptTerms, username?` |
+| GET | `/google/start` | – | `?redirectUri=myvolapp://oauth/google&codeChallenge=<S256>` → 302 to Google (browser flow, below) |
+| GET | `/callback/google` | – | Google's redirect (registered in Google Cloud) → 302 to `redirectUri?code=…` or `?error=cancelled|google_error` |
 | POST | `/refresh` | – | `refreshToken` (or the cookie) |
 | POST | `/logout` | – | `refreshToken` (or the cookie) |
 | GET | `/username-available` | – | `?username=` |
@@ -163,7 +165,8 @@ Errors are `{ status, message, code?, details? }`. Branch on `code`, show `messa
 |---|---|---|
 | 401 | `TOKEN_EXPIRED` | call `/refresh` **once** (single-flight across all pending requests) and retry |
 | 401 | `SESSION_INVALID`, `ACCOUNT_INACTIVE`, `TOKEN_INVALID`, `NOT_AUTHENTICATED` | clear tokens, go to login |
-| 400 | `PROFILE_REQUIRED` | (Google) ask for `details[].field`, call `/google` again with the same idToken |
+| 400 | `PROFILE_REQUIRED` | (Google) ask for `details[].field`, call `/google` again with the same idToken or googleCode (valid 10 min) |
+| 401 | `GOOGLE_TOKEN_INVALID` | Google sign-in expired or was tampered with: start again |
 | 403 | `INVALID_PASSWORD` / `REAUTH_REQUIRED` | show error / ask the user to sign in again. **Not** a logout |
 | 403 | `EMAIL_NOT_VERIFIED` | open the verify-email screen |
 | 403 | `ACCOUNT_SUSPENDED` | show a suspension notice |
@@ -173,13 +176,26 @@ Errors are `{ status, message, code?, details? }`. Branch on `code`, show `messa
 | 409 | `PHONE_LIMIT_REACHED` | number already has 4 accounts: show `message` |
 | 429 | `ACCOUNT_LOCKED`, `CODE_COOLDOWN`, `CODE_LIMIT`, `RATE_LIMITED` | show `message` |
 
+### Google sign-in through the browser (D80)
+
+The app has no Google SDK. It opens `/auth/google/start` in a Custom Tab with a PKCE challenge; the server
+sends it to Google, Google returns to `/auth/callback/google`, the server swaps the code for an ID token
+(client secret), verifies it (signature, audience, nonce) and redirects to `myvolapp://oauth/google?code=<sealed
+ticket>`. The app posts `{ googleCode, codeVerifier }` to `/google`. Env: `GOOGLE_WEB_CLIENT_ID`,
+`GOOGLE_WEB_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI` (must be listed on the OAuth client in Google Cloud;
+locally `http://localhost:3000/api/v1/auth/callback/google`, which also works on a USB phone through
+`adb reverse tcp:3000 tcp:3000`), `GOOGLE_APP_REDIRECT_URIS`.
+
 ### Policies
 
 - Passwords: argon2id; 8–128 chars, a letter and a number, not a common password, not containing the username/email.
 - Age gate: `MIN_SIGNUP_AGE` (13). Terms acceptance is timestamped.
 - Lockout: every 5th consecutive failed login locks the account (15 min, doubling, max 24 h).
 - 6-digit codes: HMAC-hashed, 5 tries each, 60 s resend cooldown, max 5 per hour.
-  **Without `SMTP_URL`, mail (and codes) are printed to the server console outside production.**
+  Mail goes through **AWS SES** (`SES_ACCESS_KEY_ID`/`SES_SECRET_ACCESS_KEY`, same account and verified sender as
+  Skills Forall) or `SMTP_URL`; with neither, it is printed to the server console outside production. Addresses
+  at `example.com`, `*.local`, `*.test` (Postman, seeds) are never sent, only printed, so they can't bounce.
+  `EXPOSE_OTP_IN_RESPONSE` echoes `devOtp` only for codes that were **not** really emailed (and for SMS codes).
 - Max 10 live sessions per user; the least recently used one is logged out.
 - Deactivate = hidden until next login. Delete = 30-day grace, then purged by the cleanup job.
 - Use `requireVerified` (after `protect`) on routes that create content or message people. A verified
@@ -583,6 +599,7 @@ Base `/api/v1`. **Every route needs `Authorization: Bearer`.** Limit: 90 searche
 | GET | `/search/users` | `q` (1–100, a leading `@` is ignored), `cursor`, `limit` | "Volunteers" tab: username, name or city. Ranked exact → prefix → close match (typos) → followers. Rows add `city` |
 | GET | `/search/posts` | `q` (a leading `#` is ignored), `cursor`, `limit` | "Activities" tab: title, description, location, category, author name or hashtag. Newest first; only posts you may see |
 | GET | `/search/hashtags` | `q` (a leading `#` is ignored), `cursor`, `limit` | → `{ hashtags: [{ name, postsCount }] }`: exact, then prefix (most used first), then close matches |
+| GET | `/hashtags/trending` | `days` (1–90, default 30), `limit` (1–30, default 12) | Explore's "Trending tags" → `{ days, hashtags: [{ name, recentCount, postsCount }] }`: public activities only, most used in the last `days` first, then all-time |
 | GET | `/hashtags/:tag/posts` | `cursor`, `limit` | A tag's page → `{ hashtag: { name, postsCount }, posts, nextCursor }`. 404 `HASHTAG_NOT_FOUND` |
 
 Matching uses Postgres `pg_trgm` (the migration creates it; no superuser needed). People and hashtag

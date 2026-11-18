@@ -71,8 +71,21 @@ const schema = z.object({
 
     // Google sign-in: every OAuth client ID whose ID tokens we accept (Android, iOS, web).
     GOOGLE_CLIENT_IDS: z.string().default(''),
+    // Browser sign-in (auth/google/start → Google → auth/callback/google → back to the app).
+    // A "Web application" OAuth client; the redirect URI must be listed on it in Google Cloud.
+    // Its ID is accepted as an ID-token audience automatically.
+    GOOGLE_WEB_CLIENT_ID: z.string().optional(),
+    GOOGLE_WEB_CLIENT_SECRET: z.string().optional(),
+    // Default: PUBLIC_BASE_URL + /api/v1/auth/callback/google
+    GOOGLE_OAUTH_REDIRECT_URI: z.url().optional(),
+    // Where the callback may send the user back to (exact match, comma-separated).
+    GOOGLE_APP_REDIRECT_URIS: z.string().default('myvolapp://oauth/google'),
 
-    // Email. Without SMTP_URL, mail is printed to the console outside production.
+    // Email. AWS SES (SendRawEmail) wins over SMTP_URL. With neither, mail is printed
+    // to the console outside production.
+    SES_ACCESS_KEY_ID: z.string().optional(),
+    SES_SECRET_ACCESS_KEY: z.string().optional(),
+    SES_REGION: z.string().default('ap-south-1'),
     SMTP_URL: z.url().optional(),
     // FCM wake-ups for closed apps (pushService): the Firebase service-account key, as a
     // file path relative to the project root, or (for hosts that only take env vars) the
@@ -102,15 +115,23 @@ if (env.NODE_ENV === 'production' && env.EXPOSE_OTP_IN_RESPONSE) {
     process.exit(1);
 }
 
-if (env.NODE_ENV === 'production' && !env.SMTP_URL) {
-    console.warn('[env] SMTP_URL is not set: verification and reset codes cannot be delivered.');
+const sesConfigured = Boolean(env.SES_ACCESS_KEY_ID && env.SES_SECRET_ACCESS_KEY);
+
+if (env.NODE_ENV === 'production' && !sesConfigured && !env.SMTP_URL) {
+    console.warn('[env] Neither SES nor SMTP_URL is set: verification and reset codes cannot be delivered.');
 }
+
+const publicBaseUrl = (env.PUBLIC_BASE_URL ?? `http://localhost:${env.PORT}`).replace(/\/+$/, '');
 
 module.exports = {
     ...env,
     isProd: env.NODE_ENV === 'production',
     isTest: env.NODE_ENV === 'test',
+    sesConfigured,
     corsOrigins: list(env.CORS_ORIGINS),
-    googleClientIds: list(env.GOOGLE_CLIENT_IDS),
-    publicBaseUrl: (env.PUBLIC_BASE_URL ?? `http://localhost:${env.PORT}`).replace(/\/+$/, ''),
+    googleClientIds: [...new Set([...list(env.GOOGLE_CLIENT_IDS), env.GOOGLE_WEB_CLIENT_ID].filter(Boolean))],
+    googleWebOAuth: Boolean(env.GOOGLE_WEB_CLIENT_ID && env.GOOGLE_WEB_CLIENT_SECRET),
+    googleRedirectUri: env.GOOGLE_OAUTH_REDIRECT_URI ?? `${publicBaseUrl}/api/v1/auth/callback/google`,
+    googleAppRedirectUris: list(env.GOOGLE_APP_REDIRECT_URIS),
+    publicBaseUrl,
 };

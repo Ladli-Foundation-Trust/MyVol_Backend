@@ -89,12 +89,36 @@ const login = z.strictObject({
     deviceName,
 });
 
-const google = z.strictObject({
-    idToken: z.string().min(1, 'is required').max(4096),
-    username: username.optional(),
-    dateOfBirth: dateOfBirth.optional(),
-    acceptTerms: acceptTerms.optional(),
-    deviceName,
+// PKCE (RFC 7636): verifier = 43–128 unreserved chars; challenge = base64url(sha256) = 43.
+const codeVerifier = z.string().regex(/^[A-Za-z0-9-._~]{43,128}$/, 'must be 43-128 URL-safe characters');
+
+// idToken (native Google SDK) OR googleCode + codeVerifier (browser flow, D80).
+const google = z
+    .strictObject({
+        idToken: z.string().min(1, 'is required').max(4096).optional(),
+        googleCode: z.string().min(1).max(4096).optional(),
+        codeVerifier: codeVerifier.optional(),
+        username: username.optional(),
+        dateOfBirth: dateOfBirth.optional(),
+        acceptTerms: acceptTerms.optional(),
+        deviceName,
+    })
+    .refine((b) => Boolean(b.idToken) !== Boolean(b.googleCode), {
+        message: 'send either idToken or googleCode',
+        path: ['idToken'],
+    })
+    .refine((b) => !b.googleCode || b.codeVerifier, { message: 'is required with googleCode', path: ['codeVerifier'] });
+
+const googleStart = z.strictObject({
+    redirectUri: z.string().min(1).max(512),
+    codeChallenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/, 'must be a base64url SHA-256 (S256) challenge'),
+});
+
+// What Google sends back to the callback. Anything else is ignored.
+const googleCallback = z.object({
+    code: z.string().max(2048).optional(),
+    state: z.string().max(2048).optional(),
+    error: z.string().max(200).optional(),
 });
 
 const refresh = z.object({ refreshToken: z.string().min(1).max(512).optional() }).default({});
@@ -145,6 +169,8 @@ module.exports = {
     signup,
     login,
     google,
+    googleStart,
+    googleCallback,
     refresh,
     usernameQuery,
     forgotPassword,

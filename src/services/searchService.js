@@ -80,6 +80,28 @@ const searchHashtags = async (q, { cursor, limit }) => {
     return { hashtags: items, nextCursor };
 };
 
+// Explore's "Trending tags": tags on public activities (approved, active public authors
+// who share activities with everyone), ranked by how many were posted in the last `days`
+// days, then by all-time public use, so a quiet week still shows the community's tags.
+// Blocked authors aren't subtracted: these are counts, and each tag's page applies the
+// viewer's own visibility rule.
+const trendingHashtags = async ({ days, limit }) => {
+    const rows = await prisma.$queryRaw`
+        SELECT h.name,
+               count(*) FILTER (WHERE p.created_at >= now() - make_interval(days => ${days}))::int AS "recentCount",
+               count(*)::int AS "postsCount"
+        FROM post_hashtags ph
+        JOIN hashtags h ON h.id = ph.hashtag_id
+        JOIN posts p ON p.id = ph.post_id
+        JOIN users u ON u.id = p.author_id
+        WHERE p.status = 'APPROVED' AND u.status = 'ACTIVE'
+          AND NOT u.is_private AND u.activity_visibility = 'everyone'
+        GROUP BY h.id, h.name
+        ORDER BY "recentCount" DESC, "postsCount" DESC, h.name
+        LIMIT ${limit}`;
+    return { days, hashtags: rows };
+};
+
 // A hashtag's page: the tag and its posts the viewer may see, newest first.
 const hashtagPosts = async (viewerId, tag, query) => {
     const hashtag = await prisma.hashtag.findUnique({ where: { name: tag }, select: { name: true, postsCount: true } });
@@ -87,4 +109,4 @@ const hashtagPosts = async (viewerId, tag, query) => {
     return { hashtag, ...(await posts.hashtagFeed(viewerId, tag, query)) };
 };
 
-module.exports = { searchUsers, searchPosts, searchHashtags, hashtagPosts };
+module.exports = { searchUsers, searchPosts, searchHashtags, trendingHashtags, hashtagPosts };
