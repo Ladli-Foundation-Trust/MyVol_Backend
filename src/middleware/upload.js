@@ -71,4 +71,15 @@ const requireMedia = (req, res, next) => {
     next();
 };
 
-module.exports = { avatarUpload, postUpload, storyUpload, requireFile, requireMedia, MAX_POST_MEDIA };
+// An announcement picture: one image in "image", in memory like avatars.
+const announcementImageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: env.MAX_POST_IMAGE_MB * 1024 * 1024, files: 1, fields: 0 },
+}).single('image');
+
+const requireImage = (req, res, next) => {
+    if (!req.file) return next(new AppError('Attach an image in the "image" form field', 400, undefined, 'FILE_REQUIRED'));
+    next();
+};
+
+module.exports = { announcementImageUpload, requireImage, avatarUpload, postUpload, storyUpload, requireFile, requireMedia, MAX_POST_MEDIA };

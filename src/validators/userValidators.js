@@ -71,4 +71,4 @@ const suggestionsQuery = z.strictObject({ limit: z.coerce.number().int().min(1).
 // Re-authentication: users with a password must send it (Google-only accounts: a recent sign-in).
 const exportData = z.strictObject({ password: z.string().max(200).optional() }).default({});
 
-module.exports = { updateMe, changeUsername, userParams, requestParams, listQuery, suggestionsQuery, exportData };
+module.exports = { PREFERRED_AREAS, updateMe, changeUsername, userParams, requestParams, listQuery, suggestionsQuery, exportData };

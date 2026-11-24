@@ -59,7 +59,8 @@ const rippleQueue = listQuery.extend({
 
 const reportQueue = listQuery.extend({
     status: upper(['open', 'resolved', 'dismissed']).default('OPEN'),
-    type: upper(['post', 'comment', 'user', 'story', 'problem']).optional(),
+    // content = every type except problem (the admin panel keeps bug reports apart).
+    type: upper(['post', 'comment', 'user', 'story', 'problem', 'content']).optional(),
 });
 
 const reason = (max = 300) => details(3, max);

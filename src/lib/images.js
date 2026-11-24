@@ -53,4 +53,23 @@ const toPostImage = async (buffer) => {
     }
 };
 
-module.exports = { toAvatar, toPostImage };
+// Announcement picture: JPEG (not WebP), because Android shows it as the
+// notification's big picture and JPEG is the format every phone's notification
+// renderer accepts. At most 1200 px wide (FCM recommends ~2:1 and under 1 MB).
+const ANNOUNCEMENT_MAX_WIDTH = 1200;
+const toAnnouncementImage = async (buffer) => {
+    await assertImage(buffer);
+    try {
+        const { data, info } = await sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS })
+            .rotate()
+            .resize(ANNOUNCEMENT_MAX_WIDTH, ANNOUNCEMENT_MAX_WIDTH, { fit: 'inside', withoutEnlargement: true })
+            .flatten({ background: '#ffffff' }) // transparent PNGs get a white background, not black
+            .jpeg({ quality: 82, mozjpeg: true })
+            .toBuffer({ resolveWithObject: true });
+        return { buffer: data, width: info.width, height: info.height };
+    } catch {
+        throw invalidImage();
+    }
+};
+
+module.exports = { toAvatar, toPostImage, toAnnouncementImage };

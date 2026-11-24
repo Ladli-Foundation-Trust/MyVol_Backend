@@ -885,6 +885,53 @@ uploads in the background with progress on your Home bubble and a "Try again" di
 **Tests.** `test/stories.test.js` "liking a story" (3) + recent viewers. Postman folder 29: 9 requests
 after "A: who watched the first story".
 
+### D83. Admin panel: a separate staff web app over read-model endpoints (2026-11-24)
+**Decision.** The staff tool is its own Next.js app (`ladli/myvol-admin`, port 3002), not pages inside
+myvol.org: different audience, no SEO, and it can later sit behind a VPN or IP allow-list. It signs in with
+the normal `/auth/login` (REVIEWER/ADMIN only) and reaches the API through Next rewrites (`/api/v1/*`,
+`/uploads/*` → `API_ORIGIN`), so the browser sees one origin: no CORS entry, and the refresh cookie
+(path `/api/v1/auth`, SameSite=Strict) works first-party; the access token stays in memory.
+New read models live in `adminService` (D83 endpoints in the README "Admin panel API"): dashboards and
+analytics are computed on request from existing tables (no event tracking, no counters to keep in sync);
+tables page by number with totals. Reviewers get content views; members, security and system are ADMIN
+only. Three small account tools were added (sign out everywhere, verify email by hand, clear photo/bio),
+each logged to `moderation_actions` like every other staff action. `/admin/reports?type=content` excludes
+problem reports. `server.keepAliveTimeout` is now 65 s (above the usual 60 s proxy idle timeout), because
+the panel's proxy hit ECONNRESET when Node closed idle sockets first; the same applies behind nginx/ALB.
+**Why.** Moderation already existed as an API with no UI, so posts could only be reviewed from Postman.
+Computing on read is fine at our size (each query is indexed or bounded; the 30-day overview is ~250 ms on
+the dev DB). When it grows: cache overview/analytics for a few minutes or roll daily numbers into a table.
+**Tests.** `test/admin.test.js` (8). Postman folder 36 (25 requests).
+
+### D84. Announcements: broadcast as ordinary notifications (2026-11-24)
+**Decision.** An `announcements` table holds the message, its audience filter (JSON) and status
+(SCHEDULED → SENDING → SENT, or CANCELLED / WITHDRAWN). Sending writes one `ANNOUNCEMENT` notification per
+recipient (`notifications.announcement_id`, ON DELETE CASCADE, dedupe key `announcement:<id>`), so it uses
+everything notifications already have: the Activity list and unread badge, the WebSocket, FCM banners, the
+`notifAnnouncements` setting (stored since D58 but unused until now), pause-all and quiet hours. FCM and the
+app's local banner gain an optional title (the headline). The audience is evaluated at send time. Delivery
+goes 50 at a time (`deliverInBatches`) instead of one job per row. A one-minute scheduler in server.js sends
+due messages and resumes a send stuck in SENDING for 10+ minutes (`updated_at`); `skipDuplicates` makes that
+safe. Withdraw deletes the rows (banners already shown can't be recalled). Every action is in
+`moderation_actions` (SEND/SCHEDULE/CANCEL/WITHDRAW_ANNOUNCEMENT; tests aren't logged). Links: `https://`
+or `myvolapp://` only; the app opens web pages in the browser and lands on Notifications
+(`config/linking.js toAppUrl`).
+**Why.** One row per recipient costs storage (~250 B each; 100k members ≈ 25 MB per message, aged out by
+NOTIFICATION_RETENTION_DAYS), but it gives per-person read state (the open rate), works offline, and needed
+no new delivery path. A "fan-out on read" design (one row, merged into each list) would save space and is
+the upgrade if messages get frequent at large scale. FCM topics were rejected: no per-person settings,
+quiet hours or read tracking.
+**Pictures (same day).** Optional, uploaded first (`POST /admin/announcements/image`) so the panel previews
+the exact result. Stored as JPEG, not WebP like posts: FCM's `notification.image` is drawn by Android's
+own notification renderer, and JPEG is the format every phone handles there. Max 1200 px wide (FCM advises
+~2:1 under 1 MB). The size is encoded in the key, so neither the API nor a future S3 driver has to read
+the file to lay it out. Several announcements can share a picture ("Use again"); the hourly sweep deletes
+only files older than a day that no announcement references (`storage.list/exists` added for it). The app
+shows it as the row's thumbnail and on top of the message dialog. The app's own foreground banner
+(expo-notifications) has no picture: Android local notifications from expo-notifications can't attach
+one; FCM shows it when the app is in the background or closed.
+**Tests.** `test/announcements.test.js` (10). App: linking + notificationsSlice tests. Postman folder 37 (18).
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|
@@ -896,7 +943,7 @@ after "A: who watched the first story".
 | Presence ("active now") | `showActivityStatus` is stored; presence belongs with chat. |
 | Geo "near you" by distance | By profile city for now (D61); needs PostGIS + coordinates. `nearbyRadius` is stored. |
 | Sensitive-content flag on posts | `sensitiveContent` is stored; posts have no flag yet. |
-| Announcements / reminders / weekly digest emails | Settings stored; no sender yet. |
+| Reminders / weekly digest emails | Settings stored; no sender yet. (Announcements: D84.) |
 | Permanent medal awards / certificates | Medals follow the current count (D57). Needs a `user_medals` table (`user_badges` from D69 could hold them). |
 | Adding companions after posting | Companions are named on create only (D72). A reviewer request covers the case where nobody was named. |
 | Passport per-cause stamps | Parked after the market scan: common elsewhere. Hidden badges were built instead (D76). |

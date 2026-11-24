@@ -41,11 +41,12 @@ const isRetryable = (status) => !status || status === 429 || status >= 500;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // What FCM gets for one notification. `data` values must be strings.
-const toMessage = (token, { notificationId, body, url, channelId }) => ({
+const toMessage = (token, { notificationId, title, body, imageUrl, url, channelId }) => ({
     token,
-    // No title: Android already shows the app name above it, and the text starts with who
-    // did it ("Priya Sharma commented: …"), the same as the app's own banners.
-    notification: { body },
+    // Usually no title: Android already shows the app name above it, and the text starts
+    // with who did it ("Priya Sharma commented: …"). Announcements send their headline.
+    // imageUrl (announcements): Android downloads it and shows it as the big picture.
+    notification: { ...(title && { title }), body, ...(imageUrl && { image: imageUrl }) },
     data: { type: 'notification', notificationId, url: url ?? '', tag: notificationId },
     android: {
         priority: 'HIGH',
@@ -157,7 +158,7 @@ const tokensFor = (userId) =>
 // ---------- sending ----------
 
 // Shows notification `notificationId` on every live device of `userId`:
-// { notificationId, body, url, channelId }. Never throws: a push failure must not break
+// { notificationId, title?, body, imageUrl?, url, channelId }. Never throws: a push failure must not break
 // the action that caused it. Resolves to one result per device.
 const notify = async (userId, payload) => {
     const send = getTransport();

@@ -69,6 +69,13 @@ const sendToUser = (userId, event) => {
 
 const connectedDevices = (userId) => sockets.get(userId)?.size ?? 0;
 
+// For the admin panel: people with the app open right now (on this server process).
+const onlineStats = () => {
+    let devices = 0;
+    for (const set of sockets.values()) devices += set.size;
+    return { users: sockets.size, devices };
+};
+
 // Closes every connection of a user at once (e.g. suspended), instead of waiting for
 // the 30 s session check.
 const disconnectUser = (userId, reason = 'ACCOUNT_INACTIVE') => {
@@ -196,4 +203,4 @@ const attach = (server, { onReady } = {}) => {
     };
 };
 
-module.exports = { PATH, CLOSE, attach, sendToUser, connectedDevices, disconnectUser };
+module.exports = { PATH, CLOSE, attach, sendToUser, connectedDevices, onlineStats, disconnectUser };

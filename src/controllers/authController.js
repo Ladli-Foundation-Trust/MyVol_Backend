@@ -152,6 +152,7 @@ exports.deactivate = async (req, res) => {
     sendMessage(res, 'Your account is deactivated. Log in any time to reactivate it');
 };
 
+
 exports.deleteAccount = async (req, res) => {
     const result = await accountService.scheduleDeletion(req.user, req.body, requestContext(req));
     clearRefreshCookie(res);

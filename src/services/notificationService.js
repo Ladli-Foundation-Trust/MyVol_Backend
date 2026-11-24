@@ -48,6 +48,7 @@ const TYPE_NAMES = {
     VOUCHED: 'vouched',
     RIPPLE_REVIEWED: 'ripple_reviewed',
     STORY_LIKE: 'story_like',
+    ANNOUNCEMENT: 'announcement',
 };
 
 // The setting (settingsService) that controls the phone banner for each type.
@@ -73,6 +74,8 @@ const ALERT_SETTING = {
     VOUCHED: 'notifLikes',
     RIPPLE_REVIEWED: 'notifActivityApproved',
     STORY_LIKE: 'notifLikes',
+    // Messages from the MyVol team (announcementService).
+    ANNOUNCEMENT: 'notifAnnouncements',
 };
 
 // Unique per recipient: the same event can't be recorded twice.
@@ -92,6 +95,7 @@ const keys = {
     vouched: (postId, actorId) => `vouched:${postId}:${actorId}`,
     rippleReview: (postId) => `ripple_review:${postId}`,
     storyLike: (storyId, actorId) => `story_like:${storyId}:${actorId}`,
+    announcement: (announcementId) => `announcement:${announcementId}`,
 };
 
 // ---------- recording (always inside the caller's transaction `tx`) ----------
@@ -262,6 +266,7 @@ const INCLUDE = {
     },
     comment: { select: { id: true, text: true } },
     story: { select: { id: true, type: true, key: true, thumbnailKey: true } },
+    announcement: { select: { id: true, title: true, body: true, linkUrl: true, imageKey: true, imageWidth: true, imageHeight: true } },
 };
 
 // Notifications from deactivated or suspended users are hidden (they come back if the
@@ -314,6 +319,8 @@ const messageFor = (n) => {
             return `${name} vouched for your activity "${title}": they were there with you.`;
         case 'STORY_LIKE':
             return `${name} liked your story.`;
+        case 'ANNOUNCEMENT':
+            return n.announcement ? `${n.announcement.title}: ${n.announcement.body}` : 'A message from the MyVol team.';
         case 'RIPPLE_REVIEWED':
             return n.post?.rippleStatus === 'REJECTED'
                 ? `A reviewer couldn't confirm what inspired "${title}"${n.post.rippleRejectionReason ? `: ${n.post.rippleRejectionReason}` : '.'}`
@@ -326,6 +333,8 @@ const messageFor = (n) => {
 // Where tapping it goes: the post if there is one, otherwise the person (a medal opens
 // your own profile, where the Impact tab is; a ripple badge opens your ripple).
 const urlFor = (n) => {
+    // An announcement opens its own link, or the Activity list where it can be read.
+    if (n.type === 'ANNOUNCEMENT') return n.announcement?.linkUrl || `${APP_SCHEME}://notifications`;
     if (n.type === 'BADGE_EARNED') return `${APP_SCHEME}://ripple/${n.recipientId}`;
     if (n.type === 'MEDAL_EARNED') return `${APP_SCHEME}://user/${n.recipientId}`;
     if (n.postId) return `${APP_SCHEME}://post/${n.postId}`;
@@ -354,6 +363,19 @@ const toNotification = (n, viewerId, rel) => ({
     type: TYPE_NAMES[n.type],
     message: messageFor(n),
     ...(n.type === 'BADGE_EARNED' && { badge: badgeOf(n) }),
+    ...(n.type === 'ANNOUNCEMENT' && {
+        announcement: n.announcement
+            ? {
+                  id: n.announcement.id,
+                  title: n.announcement.title,
+                  body: n.announcement.body,
+                  linkUrl: n.announcement.linkUrl,
+                  imageUrl: storage.urlFor(n.announcement.imageKey),
+                  imageWidth: n.announcement.imageWidth,
+                  imageHeight: n.announcement.imageHeight,
+              }
+            : null,
+    }),
     actor: n.actor ? toCard(n.actor, viewerId, rel) : null,
     post: n.post ? { id: n.post.id, title: n.post.title, thumbnailUrl: thumbnailUrl(n.post) } : null,
     comment: n.comment ? { id: n.comment.id, text: n.comment.text } : null,
@@ -496,7 +518,10 @@ const sendOne = async (id) => {
     const prefs = await getSettings(n.recipientId);
     const alert = await alertFor(n, prefs);
     if (alert) {
-        const payload = { notificationId: n.id, body: messageFor(n), url: urlFor(n), channelId: alert.channelId };
+        // Announcements carry a headline and maybe a picture (the notification's big picture).
+        const a = n.type === 'ANNOUNCEMENT' ? n.announcement : null;
+        const text = a ? { title: a.title, body: a.body, imageUrl: storage.urlFor(a.imageKey) } : { body: messageFor(n) };
+        const payload = { notificationId: n.id, ...text, url: urlFor(n), channelId: alert.channelId };
         track(push.notify(n.recipientId, payload), `push for ${n.id}`);
     }
     if (!online) return;
@@ -527,6 +552,21 @@ const track = (job, what) => {
 // Accepts an id, null, or an array of them.
 const deliver = (ids) => {
     for (const id of [ids].flat().filter(Boolean)) track(sendOne(id), `notification ${id}`);
+};
+
+// Many notifications at once (an announcement to thousands): sent `size` at a time in
+// one tracked background job, so the DB pool and FCM aren't flooded.
+const deliverInBatches = (ids, size = 50) => {
+    const list = [ids].flat().filter(Boolean);
+    if (list.length === 0) return;
+    track(
+        (async () => {
+            for (let i = 0; i < list.length; i += size) {
+                await Promise.all(list.slice(i, i + size).map((id) => sendOne(id).catch((err) => console.error(`[realtime] notification ${id} failed:`, err.message))));
+            }
+        })(),
+        `${list.length} notifications`,
+    );
 };
 
 // Tells these users' devices their new unread count (after an undo, a read, a delete).
@@ -584,7 +624,9 @@ module.exports = {
     deleteNotification,
     // live delivery
     deliver,
+    deliverInBatches,
     syncCount,
+    keys,
     settle,
     sendTest,
     inQuietHours,

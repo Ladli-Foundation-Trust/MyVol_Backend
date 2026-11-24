@@ -19,6 +19,29 @@ const save = async (key, buffer) => {
 
 const remove = (key) => fs.rm(path.join(ROOT, key), { force: true });
 
+// Keys under a folder with their last-modified time (for cleaning up unused uploads).
+const list = async (prefix) => {
+    const dir = path.join(ROOT, prefix);
+    let names;
+    try {
+        names = await fs.readdir(dir);
+    } catch {
+        return [];
+    }
+    const out = [];
+    for (const name of names) {
+        const stat = await fs.stat(path.join(dir, name)).catch(() => null);
+        if (stat?.isFile()) out.push({ key: `${prefix}/${name}`, modifiedAt: stat.mtime });
+    }
+    return out;
+};
+
+const exists = (key) =>
+    fs.access(path.join(ROOT, key)).then(
+        () => true,
+        () => false,
+    );
+
 const urlFor = (key) => (key ? `${env.publicBaseUrl}/uploads/${key}` : null);
 
-module.exports = { ROOT, save, remove, urlFor };
+module.exports = { ROOT, save, remove, list, exists, urlFor };

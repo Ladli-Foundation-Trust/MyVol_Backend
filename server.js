@@ -5,7 +5,10 @@ const { runAuthCleanup } = require('./src/jobs/authCleanup');
 const realtime = require('./src/lib/realtime');
 const notifications = require('./src/services/notificationService');
 
+const announcements = require('./src/services/announcementService');
+
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const ANNOUNCEMENT_CHECK_MS = 60 * 1000;
 
 const cleanup = () =>
     runAuthCleanup()
@@ -26,16 +29,30 @@ const start = async () => {
         console.log(`Live notifications on ws://localhost:${env.PORT}${realtime.PATH}`);
         console.log(`Closed-app notifications (FCM): ${require('./src/services/pushService').describe()}`);
     });
+    // Longer than the 60 s idle timeout of proxies in front of us (nginx, load balancers,
+    // the admin panel's rewrites), so they never reuse a socket Node has just closed
+    // (that shows up as random ECONNRESET / 502s). headersTimeout must be larger still.
+    server.keepAliveTimeout = 65_000;
+    server.headersTimeout = 66_000;
     // The WebSocket shares the HTTP port; 'ready' tells a new connection its badge count.
     const live = realtime.attach(server, { onReady: (user) => notifications.unreadCount(user.id) });
 
     cleanup();
     // unref: the timer alone must not keep the process alive during shutdown.
     const cleanupTimer = setInterval(cleanup, CLEANUP_INTERVAL_MS).unref();
+    // Scheduled announcements go out within a minute of their time (D84).
+    let ticks = 0;
+    const announcementTimer = setInterval(() => {
+        announcements.sendDue().catch((err) => console.error('[announcements] scheduler failed:', err.message));
+        // Hourly: pictures uploaded for announcements that were never written.
+        ticks += 1;
+        if (ticks % 60 === 0) announcements.removeOrphanImages().catch((err) => console.error('[announcements] image cleanup failed:', err.message));
+    }, ANNOUNCEMENT_CHECK_MS).unref();
 
     const shutdown = (signal) => {
         console.log(`${signal} received, shutting down`);
         clearInterval(cleanupTimer);
+        clearInterval(announcementTimer);
         live.close(); // the apps reconnect to the next server
         server.close(async () => {
             await notifications.settle(); // let notifications already on their way finish

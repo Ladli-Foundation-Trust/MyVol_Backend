@@ -258,7 +258,7 @@ const thumb = (post) => {
 // Oldest first (a queue). Moderators see who reported; the reported person never does.
 const listReports = async (moderatorId, { status, type, cursor, limit }) => {
     const rows = await prisma.report.findMany({
-        where: { status, ...(type && { type }), ...afterCursor(cursor, 'id', 'asc') },
+        where: { status, ...(type === 'CONTENT' ? { type: { not: 'PROBLEM' } } : type && { type }), ...afterCursor(cursor, 'id', 'asc') },
         orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         take: limit + 1,
         include: REPORT_INCLUDE,

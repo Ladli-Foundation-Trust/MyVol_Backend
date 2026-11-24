@@ -72,6 +72,19 @@ enum NotificationType {
   RIPPLE_REVIEWED
   // "Aarav liked your story". storyId is set; the row goes with the story.
   STORY_LIKE
+  // A message from the MyVol team (admin panel broadcast). announcementId is set; no
+  // actor. Withdrawing the announcement deletes these rows (ON DELETE CASCADE).
+  ANNOUNCEMENT
+}
+
+// SCHEDULED → SENDING → SENT, or CANCELLED before it went out. WITHDRAWN = sent, then
+// taken back out of everyone's Activity list.
+enum AnnouncementStatus {
+  SCHEDULED
+  SENDING
+  SENT
+  CANCELLED
+  WITHDRAWN
 }
 
 // Whether an inspired post's link counts in ripples (null on posts with no link).
@@ -165,6 +178,7 @@ model User {
   badges            UserBadge[]
   companionOf       PostCompanion[]
   ripplesVerified   Post[]             @relation("rippleVerifier")
+  announcements     Announcement[]
 
   @@index([status, deletionScheduledAt])
   @@index([phone])
@@ -596,6 +610,8 @@ model Notification {
   commentId   String?          @map("comment_id") @db.Uuid
   // STORY_LIKE only. Expired or deleted stories take their notifications with them.
   storyId     String?          @map("story_id") @db.Uuid
+  // ANNOUNCEMENT only.
+  announcementId String?       @map("announcement_id") @db.Uuid
   // e.g. "like:<postId>:<actorId>"; see notificationService.
   dedupeKey   String           @map("dedupe_key")
   readAt      DateTime?        @map("read_at")
@@ -606,6 +622,7 @@ model Notification {
   post      Post?    @relation(fields: [postId], references: [id], onDelete: Cascade)
   comment   Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
   story     Story?   @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  announcement Announcement? @relation(fields: [announcementId], references: [id], onDelete: Cascade)
 
   @@unique([recipientId, dedupeKey])
   // The list (newest first) and the unread count.
@@ -616,7 +633,48 @@ model Notification {
   @@index([postId])
   @@index([commentId])
   @@index([storyId])
+  // An announcement's reach and read rate, and withdrawing it.
+  @@index([announcementId, readAt])
   @@map("notifications")
+}
+
+// A message from the MyVol team to many members at once (admin panel, D84). Each
+// recipient gets a normal ANNOUNCEMENT notification (Activity list + live socket + FCM
+// banner under the notifAnnouncements setting). The audience is a filter saved as JSON
+// (announcementService.audienceWhere), applied when it is sent, so a scheduled message
+// reaches whoever matches at that moment.
+model Announcement {
+  id              String             @id @default(uuid()) @db.Uuid
+  title           String
+  body            String
+  // Optional "Open" link: https://… or a myvolapp:// deep link.
+  linkUrl         String?            @map("link_url")
+  // Optional picture (storage key "announcements/<uuid>.jpg", uploaded first through
+  // POST /admin/announcements/image). JPEG so every phone shows it as the big picture
+  // of the notification. Several announcements may share one ("Use again").
+  imageKey        String?            @map("image_key")
+  imageWidth      Int?               @map("image_width")
+  imageHeight     Int?               @map("image_height")
+  // { roles?, city?, causes?, joinedWithinDays?, activeWithinDays?, inactiveForDays?, userIds? }
+  audience        Json               @default("{}")
+  status          AnnouncementStatus @default(SCHEDULED)
+  // Sent only to the admin who wrote it ("Send a test to me").
+  isTest          Boolean            @default(false) @map("is_test")
+  scheduledAt     DateTime?          @map("scheduled_at")
+  sentAt          DateTime?          @map("sent_at")
+  withdrawnAt     DateTime?          @map("withdrawn_at")
+  recipientsCount Int                @default(0) @map("recipients_count")
+  createdById     String?            @map("created_by_id") @db.Uuid
+  createdAt       DateTime           @default(now()) @map("created_at")
+  updatedAt       DateTime           @updatedAt @map("updated_at")
+
+  createdBy     User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  notifications Notification[]
+
+  // The scheduler's "due now" scan and the panel's list.
+  @@index([status, scheduledAt])
+  @@index([createdAt])
+  @@map("announcements")
 }
 
 // App settings as one JSONB object of flat keys matching the app's settingsSlice

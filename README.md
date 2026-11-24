@@ -646,6 +646,64 @@ admin with `npm run user:role -- <username> ADMIN`; after that admins use the ro
 | 409 | `REPORT_CLOSED`, `NOT_SUSPENDED`, `ACCOUNT_DELETING` | |
 | 404 | `REPORT_NOT_FOUND`, `POST_NOT_FOUND`, `COMMENT_NOT_FOUND`, `USER_NOT_FOUND` | |
 
+`/admin/reports` also takes `type=content` (everything except `problem`), so the panel keeps bug reports on
+their own page.
+
+## Admin panel API (D83)
+
+Read models and account tools for the staff web app in `../myvol-admin` (`src/services/adminService.js`).
+Same base and roles as above. Tables page by number (`page` from 1, `pageSize` 1–100, default 25) and answer
+`{ items, total, page, pageSize, pages }`, because staff jump between pages.
+
+| Method | Path | Query / body | Who | Notes |
+|---|---|---|---|---|
+| GET | `/admin/queues` | – | staff | Sidebar counters: `pendingPosts`, `openReports` (not problems), `rippleQueue`, `openProblems`, plus `autoApprove`, `reportHideThreshold` |
+| GET | `/admin/overview` | – | staff | Users by status/role, new today/7d/30d, active day/week/month (sessions used), online now (WebSocket), posts by status, engagement totals, impact (hours, beneficiaries), categories, 30 daily rows, top posts/creators (30 d), newest users, latest open reports, recent staff actions |
+| GET | `/admin/analytics` | `days` = 7 \| 14 \| 30 \| 90 \| 180 \| 365 | staff | Daily rows (signups, active, posts, comments, likes, follows, stories, reports, logins); totals vs the previous period (`change` in %, `null` when the previous was 0); audience (gender, age groups, cities, states, causes, skills, signup method, verified %, private %, push platforms); content (impact by category, media mix, hashtags, top posts/creators, per-post averages); weekly sign-up cohorts (still active / ever posted); moderation (reasons, types, avg hours to close, actions per moderator) |
+| GET | `/admin/content/posts` | `q`, `status`, `category`, `media` (`reel\|video\|photo\|text`), `featured`, `authorId`, `sort` (`newest\|oldest\|likes\|comments\|views`), paging | staff | Any privacy; each row has `openReports`; also returns every `categories` name |
+| GET | `/admin/content/posts/:postId` | – | staff | The post (staff see location and like counts even when hidden), its reports, staff history, 30 newest comments, 12 latest likers, the post that inspired it |
+| GET | `/admin/content/comments` | `q`, `offensive`, `postId`, `authorId`, paging | staff | Newest first, with post title and `openReports` |
+| GET | `/admin/content/stories` | `q`, paging | staff | Live stories only |
+| GET | `/admin/content/hashtags` | `q` (with or without `#`), paging | staff | Most used first |
+| GET | `/admin/users` | `q` (name, username, email, phone), `status`, `role`, `verified`, `sort` (`newest\|oldest\|lastLogin\|followers\|name`), paging | admin | With email, phone, counts, city, `openReports` |
+| GET | `/admin/users/:userId` | – | admin | Account, profile, counts, impact, badges, live sessions (with push platform), last 25 auth events, staff actions, reports about them, 12 latest posts, `online` devices |
+| POST | `/admin/users/:userId/logout-all` | `reason` | admin | Revokes every session and closes their sockets (`FORCE_LOGOUT`) |
+| POST | `/admin/users/:userId/verify-email` | `reason` | admin | 409 `NO_EMAIL` / `ALREADY_VERIFIED` (`VERIFY_EMAIL`) |
+| POST | `/admin/users/:userId/clear-profile` | `avatar?`, `bio?`, `reason` | admin | Deletes the photo file and/or the bio; 400 `NOTHING_TO_CLEAR` (`CLEAR_PROFILE`, old bio kept in metadata) |
+| GET | `/admin/security` | `type` (auth event), `q` (IP, username, email), paging | admin | Auth events plus `last24h` counts by type, top failing IPs (24 h), accounts locked now |
+| GET | `/admin/system` | – | admin | Process (uptime, memory, Node), DB (size, latency, connections, table sizes, last migrations), uploads by folder, live sockets, outside services (email, SMS, push, Google, storage) and the main `.env` rules |
+
+### Announcements (D84, ADMIN)
+
+A message from the MyVol team to everyone or to a filtered audience, now or scheduled. Each recipient gets
+an `announcement` notification (no actor) with `announcement: { id, title, body, linkUrl, imageUrl, imageWidth, imageHeight }`
+(the FCM message carries `notification.image`, so Android shows the picture big when expanded); the message is
+`"<title>: <body>"` and `url` is the link, or `myvolapp://notifications`. The phone banner (FCM, and the
+app's own) shows the title; it follows the member's `notifAnnouncements` setting, `pauseAll` and quiet hours
+like every other notification.
+
+| Method | Path | Body / query | Notes |
+|---|---|---|---|
+| GET | `/admin/announcements/options` | – | `causes` (the profile's preferred areas) for the audience picker |
+| POST | `/admin/announcements/audience` | `audience` | `{ count, withPush, optedOut, description }` right now |
+| POST | `/admin/announcements/image` | multipart `image` (JPEG/PNG/WebP/HEIC, ≤ `MAX_POST_IMAGE_MB`) | 201 `{ imageKey, imageUrl, width, height, bytes }`. Turned into a JPEG ≤1200 px wide (upright, no metadata, transparency on white); the size is in the key (`announcements/<uuid>_<w>x<h>.jpg`). Unused uploads are deleted after a day |
+| POST | `/admin/announcements` | `title` (3–80), `body` (3–500), `linkUrl?` (`https://` or `myvolapp://`), `imageKey?` (from the upload; 400 `IMAGE_NOT_FOUND`), `audience` (default everyone), `sendAt?` (≤60 days; future = scheduled), `test?` | 201 `{ announcement }`. `test: true` sends only to you |
+| GET | `/admin/announcements` | `status?` (`scheduled\|sending\|sent\|cancelled\|withdrawn`), paging | With `recipientsCount`, `readCount`, `readRate`, and `byStatus` counts |
+| GET | `/admin/announcements/:id` | – | Plus `readsByDay` |
+| POST | `/admin/announcements/:id/send-now` | – | Scheduled only (409 `NOT_SCHEDULED`) |
+| POST | `/admin/announcements/:id/cancel` | – | Scheduled only (409 `NOT_SCHEDULED`) |
+| POST | `/admin/announcements/:id/withdraw` | `reason` | Sent only (409 `NOT_SENT`): deletes every recipient's row |
+
+`audience` (all optional, combined with AND; only ACTIVE accounts): `roles` (`user|reviewer|admin`),
+`city` (profile city contains), `causes` (any of the preferred areas), `joinedWithinDays`,
+`activeWithinDays` / `inactiveForDays` (sessions' `last_used_at`; not both), `userIds` (≤500). It is
+applied when the message is sent. `server.js` runs `announcementService.sendDue()` every minute; a send
+claims the row (`SCHEDULED → SENDING`), writes rows 1000 at a time (`skipDuplicates`), then delivers 50
+at a time in the background, so a send that crashed is resumed after 10 minutes without duplicates.
+
+All "active" numbers come from data we already keep (sessions' `last_used_at`, logins, posts, comments,
+likes, follows, story and video views); nothing new is tracked. Days are cut in `DEFAULT_TIMEZONE`.
+
 ## Settings
 
 `GET /api/v1/settings` returns, and `PATCH /api/v1/settings` takes, the 45 keys of the app's
