@@ -7,11 +7,14 @@ const AppError = require('../utils/appError');
 const { toPostImage } = require('../lib/images');
 const { processVideo } = require('../lib/videos');
 const { afterCursor, toPage } = require('../utils/cursor');
+const notifications = require('./notificationService');
 const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, toCard } = require('./socialGraph');
 
 // Stories, as in the app's storiesSlice: one photo or clip with an optional caption,
-// gone STORY_LIFETIME_HOURS after it was shared. Not reviewed, liked or commented on,
-// never in the feed or the grid. Who may see them is the profile rule (socialGraph
+// gone STORY_LIFETIME_HOURS after it was shared. Not reviewed or commented on, never in
+// the feed or the grid. Viewers can like one (a heart, like Instagram's): the like sits
+// on their story_views row, the author sees it in the viewer list and gets a
+// "liked your story" notification. Who may see them is the profile rule (socialGraph
 // canView: public, or an approved follower; nothing across a block). The tray (the
 // Home rail) shows you and the people you follow and haven't muted, people with
 // unwatched stories first. Expired stories are filtered out on every read and
@@ -30,16 +33,44 @@ const removeFiles = (keys) =>
 
 // ---------- response shape ----------
 
-// `seen` for the viewer in one query for the whole list. The view count is the
-// author's business only.
+// How many faces the author sees on their own story ("Seen by" + avatars).
+const RECENT_VIEWERS = 3;
+
+// Who may appear in an author's viewer list: active, no block either way.
+const visibleViewer = (authorId) => ({ status: 'ACTIVE', ...notBlockedWith(authorId) });
+
+// The newest few viewers of each of the author's own stories, as user rows.
+const recentViewersOf = async (authorId, storyIds) => {
+    const byStory = new Map(storyIds.map((id) => [id, []]));
+    if (storyIds.length === 0) return byStory;
+    const rows = await prisma.$transaction(
+        storyIds.map((storyId) =>
+            prisma.storyView.findMany({
+                where: { storyId, viewer: visibleViewer(authorId) },
+                orderBy: [{ createdAt: 'desc' }, { viewerId: 'desc' }],
+                take: RECENT_VIEWERS,
+                select: { storyId: true, viewer: { select: CARD_SELECT } },
+            }),
+        ),
+    );
+    for (const r of rows.flat()) byStory.get(r.storyId).push(r.viewer);
+    return byStory;
+};
+
+// `seen` and `liked` for the viewer in one query for the whole list. Counts and the
+// latest viewers are the author's business only.
 const toStories = async (viewerId, stories) => {
     if (stories.length === 0) return [];
     const views = await prisma.storyView.findMany({
         where: { viewerId, storyId: { in: stories.map((s) => s.id) } },
-        select: { storyId: true },
+        select: { storyId: true, likedAt: true },
     });
     const seen = new Set(views.map((v) => v.storyId));
-    const rel = await relationsFor(viewerId, [...new Set(stories.map((s) => s.authorId))]);
+    const liked = new Set(views.filter((v) => v.likedAt).map((v) => v.storyId));
+    const recent = await recentViewersOf(viewerId, stories.filter((s) => s.authorId === viewerId).map((s) => s.id));
+    const rel = await relationsFor(viewerId, [
+        ...new Set([...stories.map((s) => s.authorId), ...[...recent.values()].flat().map((u) => u.id)]),
+    ]);
 
     return stories.map((s) => {
         const isMine = s.authorId === viewerId;
@@ -56,8 +87,13 @@ const toStories = async (viewerId, stories) => {
             createdAt: s.createdAt,
             expiresAt: s.expiresAt,
             seen: isMine || seen.has(s.id),
+            liked: liked.has(s.id),
             isMine,
-            ...(isMine && { viewsCount: s.viewsCount }),
+            ...(isMine && {
+                viewsCount: s.viewsCount,
+                likesCount: s.likesCount,
+                recentViewers: recent.get(s.id).map((u) => toCard(u, viewerId, rel)),
+            }),
         };
     });
 };
@@ -111,7 +147,10 @@ const createStory = async (authorId, { caption }, file) => {
 // Removes the row (its views and reports' links go with it) and then the files. Used
 // by the author and by moderators (moderationService.resolveReport).
 const removeStory = async (story) => {
+    // Its "liked your story" notifications go by cascade: the author's badge recounts.
+    const recipients = await notifications.recipientsOf(prisma, { storyId: story.id });
     await prisma.story.delete({ where: { id: story.id } });
+    notifications.syncCount(recipients);
     await removeFiles(fileKeys(story));
 };
 
@@ -230,24 +269,69 @@ const markSeen = async (viewerId, storyId) => {
     return { seen: true };
 };
 
-// Who watched your story, newest first (the author only). People with a block between
-// you are left out, like everywhere else.
+// ---------- likes ----------
+
+const ownStory = () => new AppError("You can't like your own story", 400, undefined, 'OWN_STORY');
+
+// A heart on someone's story. Liking counts as seeing it (the view is recorded too if
+// the app hadn't yet). Repeating it is harmless; the author is notified once.
+const likeStory = async (viewerId, storyId) => {
+    const story = await findVisibleStory(viewerId, storyId);
+    if (story.authorId === viewerId) throw ownStory();
+    let notificationId = null;
+    await prisma.$transaction(async (tx) => {
+        const { count: viewed } = await tx.storyView.createMany({ data: [{ storyId, viewerId }], skipDuplicates: true });
+        const { count: liked } = await tx.storyView.updateMany({ where: { storyId, viewerId, likedAt: null }, data: { likedAt: new Date() } });
+        if (viewed || liked) {
+            await tx.story.update({
+                where: { id: storyId },
+                data: { ...(viewed && { viewsCount: { increment: 1 } }), ...(liked && { likesCount: { increment: 1 } }) },
+                select: { id: true },
+            });
+        }
+        if (liked) notificationId = await notifications.storyLiked(tx, viewerId, story);
+    });
+    notifications.deliver(notificationId);
+    return { liked: true };
+};
+
+// Takes the heart back, and its notification. The view stays.
+const unlikeStory = async (viewerId, storyId) => {
+    const story = await findVisibleStory(viewerId, storyId);
+    if (story.authorId === viewerId) throw ownStory();
+    let recipients = [];
+    await prisma.$transaction(async (tx) => {
+        const { count } = await tx.storyView.updateMany({ where: { storyId, viewerId, likedAt: { not: null } }, data: { likedAt: null } });
+        if (!count) return;
+        await tx.story.update({ where: { id: storyId }, data: { likesCount: { decrement: 1 } }, select: { id: true } });
+        recipients = await notifications.storyUnliked(tx, viewerId, story);
+    });
+    notifications.syncCount(recipients);
+    return { liked: false };
+};
+
+// ---------- viewers ----------
+
+// Who watched your story, newest first (the author only), each with `liked` for the
+// heart beside their name. People with a block between you are left out, like
+// everywhere else.
 const listViewers = async (viewerId, storyId, { cursor, limit }) => {
-    const story = await prisma.story.findFirst({ where: { id: storyId, ...live() }, select: { authorId: true, viewsCount: true } });
+    const story = await prisma.story.findFirst({ where: { id: storyId, ...live() }, select: { authorId: true, viewsCount: true, likesCount: true } });
     if (!story) throw storyNotFound();
     if (story.authorId !== viewerId) throw new AppError('Only the author can see who viewed a story', 403, undefined, 'NOT_AUTHOR');
 
     const rows = await prisma.storyView.findMany({
-        where: { storyId, viewer: { status: 'ACTIVE', ...notBlockedWith(viewerId) }, ...afterCursor(cursor, 'viewerId') },
+        where: { storyId, viewer: visibleViewer(viewerId), ...afterCursor(cursor, 'viewerId') },
         orderBy: [{ createdAt: 'desc' }, { viewerId: 'desc' }],
         take: limit + 1,
-        select: { createdAt: true, viewerId: true, viewer: { select: CARD_SELECT } },
+        select: { createdAt: true, likedAt: true, viewerId: true, viewer: { select: CARD_SELECT } },
     });
     const { items, nextCursor } = toPage(rows, limit, 'viewerId');
     const rel = await relationsFor(viewerId, items.map((r) => r.viewerId));
     return {
         viewsCount: story.viewsCount,
-        viewers: items.map((r) => ({ ...toCard(r.viewer, viewerId, rel), viewedAt: r.createdAt })),
+        likesCount: story.likesCount,
+        viewers: items.map((r) => ({ ...toCard(r.viewer, viewerId, rel), viewedAt: r.createdAt, liked: Boolean(r.likedAt) })),
         nextCursor,
     };
 };
@@ -262,5 +346,7 @@ module.exports = {
     tray,
     storySummary,
     markSeen,
+    likeStory,
+    unlikeStory,
     listViewers,
 };

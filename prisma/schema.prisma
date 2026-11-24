@@ -70,6 +70,8 @@ enum NotificationType {
   VOUCH_REQUEST
   VOUCHED
   RIPPLE_REVIEWED
+  // "Aarav liked your story". storyId is set; the row goes with the story.
+  STORY_LIKE
 }
 
 // Whether an inspired post's link counts in ripples (null on posts with no link).
@@ -592,6 +594,8 @@ model Notification {
   type        NotificationType
   postId      String?          @map("post_id") @db.Uuid
   commentId   String?          @map("comment_id") @db.Uuid
+  // STORY_LIKE only. Expired or deleted stories take their notifications with them.
+  storyId     String?          @map("story_id") @db.Uuid
   // e.g. "like:<postId>:<actorId>"; see notificationService.
   dedupeKey   String           @map("dedupe_key")
   readAt      DateTime?        @map("read_at")
@@ -601,6 +605,7 @@ model Notification {
   actor     User?    @relation("actor", fields: [actorId], references: [id], onDelete: Cascade)
   post      Post?    @relation(fields: [postId], references: [id], onDelete: Cascade)
   comment   Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  story     Story?   @relation(fields: [storyId], references: [id], onDelete: Cascade)
 
   @@unique([recipientId, dedupeKey])
   // The list (newest first) and the unread count.
@@ -610,6 +615,7 @@ model Notification {
   @@index([actorId])
   @@index([postId])
   @@index([commentId])
+  @@index([storyId])
   @@map("notifications")
 }
 
@@ -801,12 +807,15 @@ model Story {
   caption      String?
   // Unique viewers (the author's own views don't count).
   viewsCount   Int       @default(0) @map("views_count")
+  // Viewers who liked it (story_views.liked_at set).
+  likesCount   Int       @default(0) @map("likes_count")
   createdAt    DateTime  @default(now()) @map("created_at")
   expiresAt    DateTime  @map("expires_at")
 
-  author  User        @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  views   StoryView[]
-  reports Report[]
+  author        User           @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  views         StoryView[]
+  reports       Report[]
+  notifications Notification[]
 
   // "This author's live stories" and the cleanup job's "expired" scan.
   @@index([authorId, expiresAt])
@@ -815,10 +824,13 @@ model Story {
 }
 
 // Who has seen a story: drives the tray's "unseen" ring and the author's viewer list.
+// A like lives on the same row (liking a story means you've seen it), like Instagram's
+// viewer list with hearts.
 model StoryView {
-  storyId   String   @map("story_id") @db.Uuid
-  viewerId  String   @map("viewer_id") @db.Uuid
-  createdAt DateTime @default(now()) @map("created_at")
+  storyId   String    @map("story_id") @db.Uuid
+  viewerId  String    @map("viewer_id") @db.Uuid
+  createdAt DateTime  @default(now()) @map("created_at")
+  likedAt   DateTime? @map("liked_at")
 
   story  Story @relation(fields: [storyId], references: [id], onDelete: Cascade)
   viewer User  @relation(fields: [viewerId], references: [id], onDelete: Cascade)

@@ -74,7 +74,9 @@ const purgeDatabase = () =>
             }
             if (viewedStoryIds.length) {
                 await tx.$executeRaw`
-                    UPDATE stories s SET views_count = (SELECT count(*) FROM story_views v WHERE v.story_id = s.id)
+                    UPDATE stories s SET
+                        views_count = (SELECT count(*) FROM story_views v WHERE v.story_id = s.id),
+                        likes_count = (SELECT count(*) FROM story_views v WHERE v.story_id = s.id AND v.liked_at IS NOT NULL)
                     WHERE s.id = ANY(${viewedStoryIds}::uuid[])`;
             }
             if (commentIds.length) {

@@ -17,7 +17,7 @@ const CATEGORIES = [
 ];
 
 // The profile's preferredAreas (userValidators.PREFERRED_AREAS) as post categories, for
-// the "recommended" home feed (postService.homeFeed).
+// suggested posts in the home feed (postService.suggestedPosts).
 const AREA_CATEGORIES = {
     'Environmental Conservation': ['Environment'],
     Education: ['Education', 'Child Rights'],

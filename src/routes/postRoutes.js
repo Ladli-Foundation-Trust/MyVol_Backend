@@ -18,6 +18,7 @@ router.post('/', requireVerified, limits.postLimiter, postUpload, validate({ bod
 
 // Fixed paths before /:postId.
 router.get('/feed', validate({ query: schemas.feedQuery }), p.feed);
+router.get('/suggested', list, p.suggested);
 router.get('/explore', validate({ query: schemas.exploreQuery }), p.explore);
 router.get('/explore/stats', p.exploreStats);
 router.get('/trending', validate({ query: schemas.trendingQuery }), p.trending);

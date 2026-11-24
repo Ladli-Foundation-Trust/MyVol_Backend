@@ -394,29 +394,111 @@ const fromFollowing = (viewerId) => ({
     author: { followers: { some: { followerId: viewerId } }, activityVisibility: { not: 'onlyMe' }, ...notMutedBy(viewerId) },
 });
 
-// What "recommended" adds to the people you follow: public activities in the causes of
-// your profile's preferredAreas, or in your city. Null when the profile has neither.
-const interestsOf = async (viewerId) => {
-    const profile = await prisma.profile.findUnique({ where: { userId: viewerId }, select: { preferredAreas: true, city: true } });
-    const categories = [...new Set((profile?.preferredAreas ?? []).flatMap((area) => AREA_CATEGORIES[area] ?? []))];
-    const or = [...(categories.length ? [{ category: { in: categories } }] : []), ...(profile?.city ? [locationContains(profile.city)] : [])];
-    return or.length ? { AND: [publicActivities(viewerId), { OR: or }] } : null;
-};
-
 // Home, by the feedSort setting (or ?sort=), always newest first so it pages with the
 // keyset cursor:
 //   latest       your own posts + people you follow
 //   following    people you follow only
-//   recommended  latest + public posts matching your interests (interestsOf)
+//   recommended  the same posts as latest; the app also mixes in GET /posts/suggested
+//                (posts from people you don't follow), like Instagram's suggested posts
 const homeFeed = async (viewerId, { sort, ...query }) => {
     const mode = sort ?? (await getSettings(viewerId)).feedSort;
     const sources = mode === 'following' ? [fromFollowing(viewerId)] : [{ authorId: viewerId }, fromFollowing(viewerId)];
-    if (mode === 'recommended') {
-        const interests = await interestsOf(viewerId);
-        if (interests) sources.push(interests);
-    }
     const page = await pageOfPosts(viewerId, { author: { status: 'ACTIVE' }, OR: sources }, query);
     return { sort: mode, ...page };
+};
+
+// ---------- suggested posts (Instagram's "Suggested for you" in the home feed) ----------
+//
+// Public activities from people the viewer doesn't follow, from the last SUGGESTED_DAYS
+// days, ranked in JS over at most SUGGESTED_POOL candidates (offset-paged like trending):
+//   engagement (trendingScore's weights) with a gentler age decay, so a good post from
+//   last week can still show up;
+//   × CAUSE_BOOST when the category is one of the profile's preferredAreas,
+//   × CITY_BOOST when it happened in the profile's city;
+//   then each further post by the same author is halved, so one busy account can't fill
+//   the list.
+// Every post says why it was picked (`suggested.reason`): cause | city | popular. With no
+// causes or city on the profile, it's simply the most engaging recent public activity.
+const SUGGESTED_POOL = 500;
+const SUGGESTED_DAYS = 30;
+const CAUSE_BOOST = 3;
+const CITY_BOOST = 2;
+
+const interestsOf = async (viewerId) => {
+    const profile = await prisma.profile.findUnique({ where: { userId: viewerId }, select: { preferredAreas: true, city: true } });
+    const city = profile?.city?.trim() || null;
+    return {
+        categories: new Set((profile?.preferredAreas ?? []).flatMap((area) => AREA_CATEGORIES[area] ?? [])),
+        city,
+        cityKey: city?.toLowerCase() ?? null,
+    };
+};
+
+const suggestionFor = (p, interests) => {
+    const cause = interests.categories.has(p.category);
+    const inCity = Boolean(interests.cityKey && p.author.showLocation && p.location?.toLowerCase().includes(interests.cityKey));
+    const engagement = p.likesCount + 2 * p.commentsCount + 2 * p.savesCount + 3 * p.sharesCount + p.viewsCount / 10;
+    const ageHours = (Date.now() - p.createdAt.getTime()) / 3_600_000;
+    const score = ((1 + engagement) / (ageHours + 2) ** 0.5) * (cause ? CAUSE_BOOST : 1) * (inCity ? CITY_BOOST : 1);
+    const reason = cause
+        ? { reason: 'cause', category: p.category }
+        : inCity
+          ? { reason: 'city', city: interests.city }
+          : { reason: 'popular' };
+    return { id: p.id, authorId: p.authorId, score, suggested: reason };
+};
+
+const suggestedPosts = async (viewerId, { cursor, limit }) => {
+    const offset = decodeOffset(cursor);
+    const [interests, candidates] = await Promise.all([
+        interestsOf(viewerId),
+        prisma.post.findMany({
+            where: {
+                AND: [
+                    publicActivities(viewerId),
+                    {
+                        authorId: { not: viewerId },
+                        author: { followers: { none: { followerId: viewerId } } },
+                        createdAt: { gte: new Date(Date.now() - SUGGESTED_DAYS * 86_400_000) },
+                    },
+                ],
+            },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: SUGGESTED_POOL,
+            select: {
+                id: true,
+                authorId: true,
+                category: true,
+                location: true,
+                createdAt: true,
+                likesCount: true,
+                commentsCount: true,
+                savesCount: true,
+                sharesCount: true,
+                viewsCount: true,
+                author: { select: { showLocation: true } },
+            },
+        }),
+    ]);
+
+    const byScore = (a, b) => b.score - a.score || (a.id < b.id ? 1 : -1);
+    const seen = new Map(); // authorId → posts of theirs ranked so far
+    const ranked = candidates
+        .map((p) => suggestionFor(p, interests))
+        .sort(byScore)
+        .map((s) => {
+            const n = seen.get(s.authorId) ?? 0;
+            seen.set(s.authorId, n + 1);
+            return { ...s, score: s.score / 2 ** n };
+        })
+        .sort(byScore);
+    const { items, nextCursor } = offsetPage(ranked.slice(offset, offset + limit + 1), offset, limit);
+
+    const rows = await prisma.post.findMany({ where: { id: { in: items.map((s) => s.id) } }, include: POST_INCLUDE });
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const picked = items.filter((s) => byId.has(s.id));
+    const posts = await toPosts(viewerId, picked.map((s) => byId.get(s.id)));
+    return { posts: posts.map((p, i) => ({ ...p, suggested: picked[i].suggested })), nextCursor };
 };
 
 // Explore: approved posts from public accounts, optionally by categories and city, in
@@ -674,6 +756,7 @@ module.exports = {
     deletePost,
     getPost,
     homeFeed,
+    suggestedPosts,
     exploreFeed,
     trendingPosts,
     exploreStats,

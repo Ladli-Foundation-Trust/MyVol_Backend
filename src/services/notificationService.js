@@ -47,6 +47,7 @@ const TYPE_NAMES = {
     VOUCH_REQUEST: 'vouch_request',
     VOUCHED: 'vouched',
     RIPPLE_REVIEWED: 'ripple_reviewed',
+    STORY_LIKE: 'story_like',
 };
 
 // The setting (settingsService) that controls the phone banner for each type.
@@ -71,6 +72,7 @@ const ALERT_SETTING = {
     VOUCH_REQUEST: 'notifMentions',
     VOUCHED: 'notifLikes',
     RIPPLE_REVIEWED: 'notifActivityApproved',
+    STORY_LIKE: 'notifLikes',
 };
 
 // Unique per recipient: the same event can't be recorded twice.
@@ -89,6 +91,7 @@ const keys = {
     vouchRequest: (postId) => `vouch_request:${postId}`,
     vouched: (postId, actorId) => `vouched:${postId}:${actorId}`,
     rippleReview: (postId) => `ripple_review:${postId}`,
+    storyLike: (storyId, actorId) => `story_like:${storyId}:${actorId}`,
 };
 
 // ---------- recording (always inside the caller's transaction `tx`) ----------
@@ -236,6 +239,13 @@ const rippleReviewed = async (tx, post) => {
     return row.id;
 };
 
+// "Aarav liked your story". Unliking removes it; the story expiring or being deleted
+// takes it along (ON DELETE CASCADE).
+const storyLiked = (tx, actorId, story) =>
+    create(tx, { type: 'STORY_LIKE', recipientId: story.authorId, actorId, storyId: story.id, dedupeKey: keys.storyLike(story.id, actorId) });
+
+const storyUnliked = (tx, actorId, story) => removeWhere(tx, { recipientId: story.authorId, dedupeKey: keys.storyLike(story.id, actorId) });
+
 // ---------- reading ----------
 
 const INCLUDE = {
@@ -251,6 +261,7 @@ const INCLUDE = {
         },
     },
     comment: { select: { id: true, text: true } },
+    story: { select: { id: true, type: true, key: true, thumbnailKey: true } },
 };
 
 // Notifications from deactivated or suspended users are hidden (they come back if the
@@ -301,6 +312,8 @@ const messageFor = (n) => {
             return `${name} says you were with them for "${title}". Can you vouch for it?`;
         case 'VOUCHED':
             return `${name} vouched for your activity "${title}": they were there with you.`;
+        case 'STORY_LIKE':
+            return `${name} liked your story.`;
         case 'RIPPLE_REVIEWED':
             return n.post?.rippleStatus === 'REJECTED'
                 ? `A reviewer couldn't confirm what inspired "${title}"${n.post.rippleRejectionReason ? `: ${n.post.rippleRejectionReason}` : '.'}`
@@ -316,6 +329,8 @@ const urlFor = (n) => {
     if (n.type === 'BADGE_EARNED') return `${APP_SCHEME}://ripple/${n.recipientId}`;
     if (n.type === 'MEDAL_EARNED') return `${APP_SCHEME}://user/${n.recipientId}`;
     if (n.postId) return `${APP_SCHEME}://post/${n.postId}`;
+    // Your own stories (the one they liked is among them).
+    if (n.type === 'STORY_LIKE') return `${APP_SCHEME}://story/${n.recipientId}`;
     if (n.actorId) return `${APP_SCHEME}://user/${n.actorId}`;
     return null;
 };
@@ -342,6 +357,7 @@ const toNotification = (n, viewerId, rel) => ({
     actor: n.actor ? toCard(n.actor, viewerId, rel) : null,
     post: n.post ? { id: n.post.id, title: n.post.title, thumbnailUrl: thumbnailUrl(n.post) } : null,
     comment: n.comment ? { id: n.comment.id, text: n.comment.text } : null,
+    story: n.story ? { id: n.story.id, thumbnailUrl: storage.urlFor(n.story.type === 'VIDEO' ? n.story.thumbnailKey : n.story.key) } : null,
     url: urlFor(n),
     read: Boolean(n.readAt),
     createdAt: n.createdAt,
@@ -556,6 +572,8 @@ module.exports = {
     vouchAnswered,
     vouched,
     rippleReviewed,
+    storyLiked,
+    storyUnliked,
     recipientsOf,
     // reading
     listNotifications,

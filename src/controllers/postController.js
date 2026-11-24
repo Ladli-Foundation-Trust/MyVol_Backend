@@ -26,7 +26,8 @@ exports.explore = async (req, res) => {
 
 exports.exploreStats = async (req, res) => ok(res, await posts.exploreStats());
 
-exports.trending = async (req, res) => ok(res, await posts.trendingPosts(req.user.id, req.validatedQuery));
+exports.suggested = async (req, res) => ok(res, await posts.suggestedPosts(req.user.id, req.validatedQuery));
+exports.trending =async (req, res) => ok(res, await posts.trendingPosts(req.user.id, req.validatedQuery));
 
 exports.reels = async (req, res) => ok(res, await posts.reelsFeed(req.user.id, req.validatedQuery));
 

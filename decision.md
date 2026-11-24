@@ -849,6 +849,42 @@ tokens avoid a table for 10-minute state.
 **Tests.** `test/auth.test.js` "google sign-in through the browser (D80)" and "dev code echo". Postman folder 9
 ("Google browser - …", 7 requests; "redeem code" needs a person to sign in at Google first).
 
+### D81. Suggested posts in the home feed, Instagram-style (2026-11-19)
+**Decision.** New `GET /posts/suggested` (cursor/limit like other lists, offset-paged like trending):
+public activities (`publicActivities`: approved, public account, activities for everyone, not blocked/muted)
+from people the viewer does **not** follow, not their own, from the last 30 days, ranked over at most 500
+candidates by `(1 + engagement) / (ageHours + 2)^0.5` (trending's engagement weights, gentler decay),
+×3 when the category is in the profile's preferredAreas, ×2 when it happened in the profile's city (author
+shows location); each further post by the same author is halved so one account can't fill the list. Every
+post carries `suggested: { reason: 'cause'|'city'|'popular', category?, city? }`.
+`feedSort=recommended` no longer mixes interest posts into `/posts/feed` by date (they could flood the feed
+and weren't labelled); `/feed` is now the same for recommended and latest. The app mixes suggestions in:
+one after every 4 posts from people you follow, labelled "Suggested for you · <cause | near city>", then a
+"Suggested posts" section after "You're all caught up" that keeps paging. `latest`/`following` show none.
+**Why.** Instagram's model: the feed stays your people first; discovery is labelled and rationed. Works for
+new users too (no causes/city → most engaging recent public posts).
+**Tests.** `test/discovery.test.js` "suggested posts" (ranking + reasons + paging, exclusions, author
+spreading). Postman folder 31: three "A's suggested posts" requests.
+
+### D82. Story likes and the author's story activity (2026-11-19)
+**Decision.** `POST /stories/:id/like` and `DELETE /stories/:id/like` (idempotent, engagement rate limit,
+the story's visibility rule; your own story → 400 `OWN_STORY`). A like is `story_views.liked_at` on the
+viewer's existing view row (liking records the view if the app hadn't), with `stories.likes_count`, rather
+than a separate table: on Instagram a story like only exists next to a view, and the viewer list is where
+the author sees it. Stories now carry `liked` for the viewer; your own also carry `likesCount` and
+`recentViewers` (newest 3 visible viewers, for the "Seen by" faces). `GET /stories/:id/viewers` adds
+`likesCount` and `liked` per viewer. A like sends a `STORY_LIKE` notification ("Aarav liked your story.",
+banner under `notifLikes`, opens `myvolapp://story/<you>`); the row has `notifications.story_id`
+(ON DELETE CASCADE), so unliking, deleting or the story expiring removes it. The purge job recounts
+`likes_count` with `views_count`.
+The app: hold to pause hides the header/footer and pauses clips; a story's timer waits for its photo/clip
+to load; swipe sideways between people; ⋯ menu (report / delete); a heart on others' stories; on yours,
+"Seen by N" with faces opens a "Story activity" sheet (views, likes, hearts on likers). Sharing a story
+uploads in the background with progress on your Home bubble and a "Try again" dialog on failure.
+**Why.** "Who saw it and who liked it" is the core feedback loop of stories; replies need chat (deferred).
+**Tests.** `test/stories.test.js` "liking a story" (3) + recent viewers. Postman folder 29: 9 requests
+after "A: who watched the first story".
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|

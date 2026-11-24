@@ -31,6 +31,10 @@ router.delete('/:storyId', story, async (req, res) => {
 
 router.post('/:storyId/view', limits.engagementLimiter, story, async (req, res) => ok(res, await stories.markSeen(req.user.id, req.params.storyId)));
 
+// A heart on someone else's story (not your own). Both are idempotent.
+router.post('/:storyId/like', limits.engagementLimiter, story, async (req, res) => ok(res, await stories.likeStory(req.user.id, req.params.storyId)));
+router.delete('/:storyId/like', limits.engagementLimiter, story, async (req, res) => ok(res, await stories.unlikeStory(req.user.id, req.params.storyId)));
+
 router.get('/:storyId/viewers', story, validate({ query: listQuery }), async (req, res) =>
     ok(res, await stories.listViewers(req.user.id, req.params.storyId, req.validatedQuery)),
 );

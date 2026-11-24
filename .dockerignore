@@ -1,0 +1,16 @@
+node_modules
+src/generated
+.env
+.env.*
+secrets
+postman
+test
+tmp
+uploads
+coverage
+*.log
+.git
+.vscode
+.idea
+TESTING.md
+scripts/seed-e2e.js
