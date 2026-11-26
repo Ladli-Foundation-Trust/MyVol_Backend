@@ -97,6 +97,10 @@ const schema = z.object({
 
     // Local testing only (Postman): echo 6-digit codes back as `devOtp` in API responses.
     EXPOSE_OTP_IN_RESPONSE: z.stringbool().default(false),
+
+    // How many reverse proxies sit in front of the API (nginx = 1; Cloudflare + nginx = 2).
+    // req.ip, and so every rate limit, depends on it.
+    TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -117,11 +121,34 @@ if (env.NODE_ENV === 'production' && env.EXPOSE_OTP_IN_RESPONSE) {
 
 const sesConfigured = Boolean(env.SES_ACCESS_KEY_ID && env.SES_SECRET_ACCESS_KEY);
 
-if (env.NODE_ENV === 'production' && !sesConfigured && !env.SMTP_URL) {
-    console.warn('[env] Neither SES nor SMTP_URL is set: verification and reset codes cannot be delivered.');
-}
-
 const publicBaseUrl = (env.PUBLIC_BASE_URL ?? `http://localhost:${env.PORT}`).replace(/\/+$/, '');
+const googleRedirectUri = env.GOOGLE_OAUTH_REDIRECT_URI ?? `${publicBaseUrl}/api/v1/auth/callback/google`;
+
+// Production refuses to start on settings that would quietly break things for users
+// (media URLs pointing at localhost, codes that never arrive, Google sign-in failing).
+if (env.NODE_ENV === 'production') {
+    const problems = [];
+    const isLocal = (url) => /^https?:\/\/(localhost|127\.|10\.|192\.168\.)/i.test(url);
+    if (!env.PUBLIC_BASE_URL || !env.PUBLIC_BASE_URL.startsWith('https://') || isLocal(env.PUBLIC_BASE_URL)) {
+        problems.push('PUBLIC_BASE_URL must be the public https origin of the API (e.g. https://api.myvol.org).');
+    }
+    if (!sesConfigured && !env.SMTP_URL) {
+        problems.push('Set SES_ACCESS_KEY_ID + SES_SECRET_ACCESS_KEY (or SMTP_URL): verification and reset codes are emailed.');
+    }
+    if (/\.local>?$/i.test(env.MAIL_FROM.trim())) {
+        problems.push('MAIL_FROM must be a verified sender address (e.g. MyVol <no-reply@myvol.org>).');
+    }
+    if (list(env.CORS_ORIGINS).length === 0) {
+        problems.push('CORS_ORIGINS must list the browser origins allowed to call the API (website + admin panel).');
+    }
+    if (env.GOOGLE_WEB_CLIENT_ID && (isLocal(googleRedirectUri) || !googleRedirectUri.startsWith('https://'))) {
+        problems.push('GOOGLE_OAUTH_REDIRECT_URI must be the https callback on the API (unset it to use PUBLIC_BASE_URL).');
+    }
+    if (problems.length) {
+        console.error(`Production configuration problems:\n - ${problems.join('\n - ')}`);
+        process.exit(1);
+    }
+}
 
 module.exports = {
     ...env,
@@ -131,7 +158,7 @@ module.exports = {
     corsOrigins: list(env.CORS_ORIGINS),
     googleClientIds: [...new Set([...list(env.GOOGLE_CLIENT_IDS), env.GOOGLE_WEB_CLIENT_ID].filter(Boolean))],
     googleWebOAuth: Boolean(env.GOOGLE_WEB_CLIENT_ID && env.GOOGLE_WEB_CLIENT_SECRET),
-    googleRedirectUri: env.GOOGLE_OAUTH_REDIRECT_URI ?? `${publicBaseUrl}/api/v1/auth/callback/google`,
+    googleRedirectUri,
     googleAppRedirectUris: list(env.GOOGLE_APP_REDIRECT_URIS),
     publicBaseUrl,
 };

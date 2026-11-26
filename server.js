@@ -49,8 +49,17 @@ const start = async () => {
         if (ticks % 60 === 0) announcements.removeOrphanImages().catch((err) => console.error('[announcements] image cleanup failed:', err.message));
     }, ANNOUNCEMENT_CHECK_MS).unref();
 
+    let stopping = false;
     const shutdown = (signal) => {
+        if (stopping) return;
+        stopping = true;
         console.log(`${signal} received, shutting down`);
+        // A long upload or a stuck keep-alive must not hold the old container forever.
+        setTimeout(() => {
+            console.error('Shutdown took over 15 s; exiting anyway');
+            process.exit(1);
+        }, 15_000).unref();
+        server.closeIdleConnections?.();
         clearInterval(cleanupTimer);
         clearInterval(announcementTimer);
         live.close(); // the apps reconnect to the next server

@@ -7,7 +7,7 @@ const audit = require('./auditService');
 const sessions = require('./sessionService');
 const phoneCodes = require('./phoneCodeService');
 const { queueMail } = require('../lib/mailer');
-const { queueSms } = require('../lib/sms');
+const { queueSms, available: smsAvailable } = require('../lib/sms');
 const { hashPassword } = require('../utils/password');
 const { assertReauthenticated } = require('./reauthService');
 const { WITH_PASSWORD, toPublicUser } = require('../utils/publicUser');
@@ -33,6 +33,14 @@ const findAccountOnPhone = async (userId, phone) => {
 // before an SMS is paid for. purpose 'login' (also used to reset a password): answers
 // the same whether or not the number has accounts, and only texts numbers that do.
 const sendCode = async ({ phone, purpose }, ctx) => {
+    if (!smsAvailable()) {
+        throw new AppError(
+            "Phone numbers can't be verified yet. Please use your email address for now.",
+            503,
+            undefined,
+            'PHONE_UNAVAILABLE',
+        );
+    }
     let otp;
     if (purpose === 'login') {
         const accounts = await prisma.user.count({ where: { phone } });

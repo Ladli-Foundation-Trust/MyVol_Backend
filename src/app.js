@@ -14,7 +14,7 @@ const apiRoutes = require('./routes');
 
 const app = express();
 
-app.set('trust proxy', 1);
+app.set('trust proxy', env.TRUST_PROXY_HOPS);
 
 app.use(helmet());
 app.use(

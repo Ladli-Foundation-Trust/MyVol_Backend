@@ -10,7 +10,9 @@ router.get('/ready', async (req, res) => {
         await prisma.$queryRaw`SELECT 1`;
         res.json({ status: 'ready', checks: { postgres: 'ok' } });
     } catch (err) {
-        res.status(503).json({ status: 'degraded', checks: { postgres: `fail: ${err.message}` } });
+        // Public endpoint: the details (host, user) stay in the log.
+        console.error('[health] postgres check failed:', err.message);
+        res.status(503).json({ status: 'degraded', checks: { postgres: 'fail' } });
     }
 });
 

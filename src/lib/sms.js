@@ -7,6 +7,11 @@ const env = require('../config/env');
 // Tests read sent messages (e.g. OTP codes) from here instead of a real phone.
 const outbox = [];
 
+// Whether a text can actually reach a phone. In production that needs a provider, so
+// phone flows answer 503 PHONE_UNAVAILABLE instead of leaving people waiting for a code.
+// Wiring a provider in: make this true when its keys are set.
+const available = () => !env.isProd;
+
 const sendSms = async ({ to, text }) => {
     if (env.isTest) {
         outbox.push({ to, text });
@@ -24,4 +29,4 @@ const queueSms = (message) => {
     sendSms(message).catch((err) => console.error('[sms] send failed:', err.message));
 };
 
-module.exports = { sendSms, queueSms, outbox };
+module.exports = { sendSms, queueSms, outbox, available };
