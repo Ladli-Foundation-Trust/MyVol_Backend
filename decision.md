@@ -932,6 +932,35 @@ shows it as the row's thumbnail and on top of the message dialog. The app's own 
 one; FCM shows it when the app is in the background or closed.
 **Tests.** `test/announcements.test.js` (10). App: linking + notificationsSlice tests. Postman folder 37 (18).
 
+### D85. Likes become reactions: Good / Excellent / Fabulous (2026-11-26)
+**Decision.** `post_likes.reaction` (enum `Reaction` GOOD | EXCELLENT | FABULOUS, default GOOD; migration
+`20261126090000_post_reactions`, existing likes became Good). It is still one row per person per post, so
+`likes_count`, ranking, notifications, export and the cleanup recount are all unchanged: a reaction *is* a
+like. `POST /posts/:id/like` takes an optional `{ reaction }` (no body = good). Reacting again with a
+different reaction switches the row (`updateMany`), with no counter change and no second notification.
+Responses: like/unlike return `reaction` + `reactionCounts`; posts carry `myReaction` and
+`reactionCounts` (`{good, excellent, fabulous}`, one `groupBy` per page; null when `likesHidden`); the
+likers list carries each person's `reaction`. The like notification now says "reacted to your activity".
+**Why.** Keeping the like table and endpoint meant no new counters, no app-wide rename and old clients keep
+working (`likedByMe` is still sent). A separate reactions table would only pay off with many reaction
+types or per-reaction notifications.
+**Tests.** `test/posts.test.js` ("reactions: switch without recounting…"). Postman folder 19 (+2 requests).
+
+### D86. Instagram-style post frames: 1:1 / 4:5 / 1.91:1, cut on the server (2026-11-26)
+**Decision.** `POST /posts` takes optional `aspect` ('1:1' | '4:5' | '1.91:1') and `crops` (JSON array, one
+per file in order: `{x,y,w,h}` fractions of the upright media, or null = centre). Every photo and video in
+the post is cut to that exact shape before storing: `lib/crop.js cropRect` turns the crop into a pixel
+rectangle at the ratio (keeping the crop's centre and area, clamped inside, even sizes for H.264), sharp
+`rotate().extract()` for photos (orientation 5-8 swap width/height first), an ffmpeg `crop=` filter before
+the 720p scale for videos (ffmpeg rotates upright before filters; a crop forces a transcode). No `aspect` =
+old behaviour (the media keeps its own shape), so older app builds keep working.
+**Why.** Posts of every odd camera shape made the feed and the profile grid look uneven. Cropping on the
+server needs no new native module in the app (no APK rebuild) and covers videos, which the phone can't
+re-encode. The app sends what the user framed (pan/pinch in `CropFrame`), and the server stays the
+authority on the final pixels. The app now shows all post media with `cover` (no letterbox bars).
+**Tests.** `test/videos.test.js` "post frames": cropRect maths, a photo cut to its blue half, a portrait
+clip cut to 360×450, validation. Postman folder 22 (+3 requests).
+
 ### Deliberately not done (yet)
 | Item | Why it was deferred |
 |---|---|

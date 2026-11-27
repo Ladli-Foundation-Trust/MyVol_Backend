@@ -11,7 +11,7 @@ const notifications = require('./notificationService');
 const impact = require('./impactService');
 const ripple = require('./rippleService');
 const { getSettings, settingsFor } = require('./settingsService');
-const { AREA_CATEGORIES } = require('../validators/postValidators');
+const { AREA_CATEGORIES, ASPECTS } = require('../validators/postValidators');
 const { CARD_SELECT, notBlockedWith, findActiveUser, relationsFor, canView, canViewActivities, toCard } = require('./socialGraph');
 
 // ---------- loading & visibility ----------
@@ -118,18 +118,29 @@ const commentAllowed = (policy, isMine, relation) => {
 // Posts as the app shows them, with likedByMe/savedByMe, the author's follow state,
 // the author's post settings (location, like count, comments, sharing) and the ripple
 // facts (rippleService.postFacts), in a handful of extra queries for the whole page.
+// { good, excellent, fabulous } for each post id (zeros included).
+const EMPTY_REACTIONS = () => ({ good: 0, excellent: 0, fabulous: 0 });
+const reactionCountsFor = async (ids) => {
+    const rows = await prisma.postLike.groupBy({ by: ['postId', 'reaction'], where: { postId: { in: ids } }, _count: { _all: true } });
+    const out = new Map(ids.map((id) => [id, EMPTY_REACTIONS()]));
+    for (const r of rows) out.get(r.postId)[r.reaction.toLowerCase()] = r._count._all;
+    return out;
+};
+const reactionCountsOf = async (postId) => (await reactionCountsFor([postId])).get(postId);
+
 const toPosts = async (viewerId, posts) => {
     if (posts.length === 0) return [];
     const ids = posts.map((p) => p.id);
     const authorIds = [...new Set(posts.map((p) => p.authorId))];
-    const [likes, saves, rel, prefsOf, rippleOf] = await Promise.all([
-        prisma.postLike.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true } }),
+    const [likes, saves, rel, prefsOf, rippleOf, reactionsOf] = await Promise.all([
+        prisma.postLike.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true, reaction: true } }),
         prisma.postSave.findMany({ where: { userId: viewerId, postId: { in: ids } }, select: { postId: true } }),
         relationsFor(viewerId, authorIds),
         settingsFor(authorIds),
         ripple.postFacts(viewerId, posts),
+        reactionCountsFor(ids),
     ]);
-    const liked = new Set(likes.map((l) => l.postId));
+    const liked = new Map(likes.map((l) => [l.postId, l.reaction.toLowerCase()]));
     const saved = new Set(saves.map((s) => s.postId));
 
     return posts.map((p) => {
@@ -162,11 +173,14 @@ const toPosts = async (viewerId, posts) => {
             // hideLikeCounts on: only the author sees the number (the likers list stays).
             likesCount: likesHidden ? null : p.likesCount,
             likesHidden,
+            // Per-reaction counts (hidden along with likesCount).
+            reactionCounts: likesHidden ? null : reactionsOf.get(p.id),
             commentsCount: p.commentsCount,
             savesCount: p.savesCount,
             sharesCount: p.sharesCount,
             viewsCount: p.viewsCount,
             likedByMe: liked.has(p.id),
+            myReaction: liked.get(p.id) ?? null,
             savedByMe: saved.has(p.id),
             // inspiredBy, inspiredCount, pledgesCount, myPledge
             ...rippleOf(p),
@@ -236,10 +250,11 @@ const isVideo = (file) => file.mimetype?.startsWith('video/');
 
 // One uploaded file (on disk, from multer) -> a media row + the files to store.
 // The real format is checked by the decoder (sharp / ffprobe), not the file name.
-const processUpload = async (file, position) => {
+// `frame` ({ ratio, crop }) cuts it to the post's aspect ratio (Instagram-style).
+const processUpload = async (file, position, frame) => {
     const id = crypto.randomUUID();
     if (isVideo(file)) {
-        const video = await processVideo(file.path);
+        const video = await processVideo(file.path, { frame });
         return {
             files: [
                 [`posts/${id}.mp4`, video.buffer],
@@ -259,7 +274,7 @@ const processUpload = async (file, position) => {
     if (file.size > env.MAX_POST_IMAGE_MB * 1024 * 1024) {
         throw new AppError(`Photos can be at most ${env.MAX_POST_IMAGE_MB} MB`, 413, undefined, 'FILE_TOO_LARGE');
     }
-    const image = await toPostImage(await fs.readFile(file.path));
+    const image = await toPostImage(await fs.readFile(file.path), frame);
     return {
         files: [[`posts/${id}.webp`, image.buffer]],
         row: { type: 'IMAGE', key: `posts/${id}.webp`, width: image.width, height: image.height, position },
@@ -272,7 +287,9 @@ const processUpload = async (file, position) => {
 // ripple of the post that inspired it (rippleService) and fulfils a pledge on that post.
 // The link starts PENDING: it counts once one of the `companions` (people who were
 // there) vouches for it, or a reviewer confirms it.
-const createPost = async (authorId, { inspiredByPostId, companions = [], ...data }, files = []) => {
+// `aspect` ('1:1' | '4:5' | '1.91:1') + `crops` (one per file, in order): every photo and
+// video is cut to that shape, so all of a post's media is the same size in the feed.
+const createPost = async (authorId, { inspiredByPostId, companions = [], aspect, crops = [], ...data }, files = []) => {
     if (files.length === 0 && !data.description) {
         throw new AppError(
             'A post without photos needs a description',
@@ -292,7 +309,8 @@ const createPost = async (authorId, { inspiredByPostId, companions = [], ...data
     try {
         const rows = [];
         for (const [i, file] of files.entries()) {
-            const { files: outputs, row } = await processUpload(file, i);
+            const frame = aspect ? { ratio: ASPECTS[aspect], crop: crops[i] ?? null } : undefined;
+            const { files: outputs, row } = await processUpload(file, i, frame);
             for (const [key, buffer] of outputs) {
                 await storage.save(key, buffer);
                 saved.push(key);
@@ -681,10 +699,10 @@ const recordView = async (viewerId, postId, { watchMs }) => {
 // races can't move the counter twice (same pattern as follows). `onAdd`/`onRemove`
 // run in the same transaction when a row really changed (likes notify the author).
 const react = (model, counter, { onAdd, onRemove } = {}) => ({
-    add: async (viewerId, postId) => {
+    add: async (viewerId, postId, extra = {}) => {
         const post = await findVisiblePost(viewerId, postId);
         const [value, notificationId] = await prisma.$transaction(async (tx) => {
-            const { count } = await tx[model].createMany({ data: [{ userId: viewerId, postId }], skipDuplicates: true });
+            const { count } = await tx[model].createMany({ data: [{ userId: viewerId, postId, ...extra }], skipDuplicates: true });
             if (!count) return [(await tx.post.findUnique({ where: { id: postId }, select: { [counter]: true } }))[counter]];
             const row = await tx.post.update({ where: { id: postId }, data: { [counter]: { increment: 1 } }, select: { [counter]: true } });
             return [row[counter], await onAdd?.(tx, viewerId, post)];
@@ -708,8 +726,18 @@ const react = (model, counter, { onAdd, onRemove } = {}) => ({
 const likes = react('postLike', 'likesCount', { onAdd: notifications.postLiked, onRemove: notifications.postUnliked });
 const saves = react('postSave', 'savesCount');
 
-const likePost = async (viewerId, postId) => ({ liked: true, likesCount: await likes.add(viewerId, postId) });
-const unlikePost = async (viewerId, postId) => ({ liked: false, likesCount: await likes.remove(viewerId, postId) });
+// Reacting = liking with a reaction. The first reaction adds the like (counter +
+// notification, as before); picking another reaction later only switches it.
+const likePost = async (viewerId, postId, reaction = 'good') => {
+    const value = reaction.toUpperCase();
+    const likesCount = await likes.add(viewerId, postId, { reaction: value });
+    await prisma.postLike.updateMany({ where: { userId: viewerId, postId, NOT: { reaction: value } }, data: { reaction: value } });
+    return { liked: true, reaction, likesCount, reactionCounts: await reactionCountsOf(postId) };
+};
+const unlikePost = async (viewerId, postId) => {
+    const likesCount = await likes.remove(viewerId, postId);
+    return { liked: false, reaction: null, likesCount, reactionCounts: await reactionCountsOf(postId) };
+};
 const savePost = async (viewerId, postId) => ({ saved: true, savesCount: await saves.add(viewerId, postId) });
 const unsavePost = async (viewerId, postId) => ({ saved: false, savesCount: await saves.remove(viewerId, postId) });
 
@@ -735,11 +763,11 @@ const listLikes = async (viewerId, postId, { cursor, limit }) => {
         where: { postId, user: { status: 'ACTIVE', ...notBlockedWith(viewerId) }, ...afterCursor(cursor, 'userId') },
         orderBy: [{ createdAt: 'desc' }, { userId: 'desc' }],
         take: limit + 1,
-        select: { createdAt: true, userId: true, user: { select: CARD_SELECT } },
+        select: { createdAt: true, userId: true, reaction: true, user: { select: CARD_SELECT } },
     });
     const { items, nextCursor } = toPage(rows, limit, 'userId');
     const rel = await relationsFor(viewerId, items.map((r) => r.userId));
-    return { users: items.map((r) => toCard(r.user, viewerId, rel)), nextCursor };
+    return { users: items.map((r) => ({ ...toCard(r.user, viewerId, rel), reaction: r.reaction.toLowerCase() })), nextCursor };
 };
 
 module.exports = {

@@ -29,7 +29,7 @@ router.get('/:postId', post, p.get);
 router.patch('/:postId', post, validate({ body: schemas.updatePost }), p.update);
 router.delete('/:postId', post, p.remove);
 
-router.post('/:postId/like', limits.engagementLimiter, post, p.like);
+router.post('/:postId/like', limits.engagementLimiter, post, validate({ body: schemas.likePost }), p.like);
 router.delete('/:postId/like', limits.engagementLimiter, post, p.unlike);
 router.get('/:postId/likes', post, list, p.likes);
 router.post('/:postId/save', limits.engagementLimiter, post, p.save);

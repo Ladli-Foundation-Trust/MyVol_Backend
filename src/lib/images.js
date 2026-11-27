@@ -1,5 +1,6 @@
 const sharp = require('sharp');
 const AppError = require('../utils/appError');
+const { cropRect } = require('./crop');
 
 // Decoded by sharp rather than trusting the upload's file name or Content-Type.
 // SVG is refused: it can carry scripts and external references.
@@ -36,14 +37,24 @@ const toAvatar = async (buffer) => {
     }
 };
 
-// Post photo: keeps its aspect ratio, longest side at most 1440 px (never enlarged),
-// upright and without metadata. Returns the size so the app can lay out the feed
-// before the image loads.
-const toPostImage = async (buffer) => {
+// Post photo: longest side at most 1440 px (never enlarged), upright and without
+// metadata. With `frame` ({ ratio, crop }) it is first cut to the post's aspect ratio
+// (lib/crop.js); without it, it keeps its own shape. Returns the size so the app can
+// lay out the feed before the image loads.
+const toPostImage = async (buffer, frame) => {
     await assertImage(buffer);
     try {
-        const { data, info } = await sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS })
-            .rotate()
+        let upright = sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS }).rotate();
+        if (frame) {
+            // The crop is in upright coordinates: EXIF orientations 5-8 swap width/height.
+            const meta = await sharp(buffer, { limitInputPixels: MAX_INPUT_PIXELS }).metadata();
+            const swap = (meta.orientation ?? 1) >= 5;
+            const w = swap ? meta.height : meta.width;
+            const h = swap ? meta.width : meta.height;
+            // rotate() then extract() in one pipeline: sharp applies the rotation first.
+            upright = upright.extract(cropRect(w, h, frame.ratio, frame.crop));
+        }
+        const { data, info } = await upright
             .resize(POST_IMAGE_MAX_SIDE, POST_IMAGE_MAX_SIDE, { fit: 'inside', withoutEnlargement: true })
             .webp({ quality: 80 })
             .toBuffer({ resolveWithObject: true });

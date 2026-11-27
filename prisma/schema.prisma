@@ -461,9 +461,18 @@ model PostMedia {
   @@map("post_media")
 }
 
+// A "like" is a reaction: Good / Excellent / Fabulous. One per person per post;
+// likes_count counts all of them, whichever was picked.
+enum Reaction {
+  GOOD
+  EXCELLENT
+  FABULOUS
+}
+
 model PostLike {
   userId    String   @map("user_id") @db.Uuid
   postId    String   @map("post_id") @db.Uuid
+  reaction  Reaction @default(GOOD)
   createdAt DateTime @default(now()) @map("created_at")
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)

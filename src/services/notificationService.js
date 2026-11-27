@@ -290,7 +290,7 @@ const messageFor = (n) => {
         case 'FOLLOW_ACCEPTED':
             return `${name} accepted your follow request.`;
         case 'POST_LIKE':
-            return `${name} liked your activity "${title}".`;
+            return `${name} reacted to your activity "${title}".`;
         case 'POST_COMMENT':
             return `${name} commented: ${text}`;
         case 'COMMENT_REPLY':

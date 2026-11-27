@@ -83,6 +83,21 @@ One-time setup: `CREATE DATABASE myvolapp_test OWNER myvolapp;` then `cp .env.te
 and fill in the password. Tests truncate tables and refuse to run unless the DB name ends in `_test`.
 Sent mail goes to an in-memory outbox (`src/lib/mailer.js`) where tests read the codes.
 
+### Demo database (showing the app to people)
+
+A separate database, `myvolapp_demo`, holds clean showcase data with no Postman or e2e
+leftovers. `.env.demo` is a copy of `.env` with `DATABASE_URL` pointing to it and
+`UPLOAD_DIR=uploads-demo`.
+
+```bash
+npm run demo:db                      # apply migrations (once, and after new migrations)
+npm run demo:seed                    # scripts/seed-showcase.js (-- --reset to recreate)
+npm run demo:seed -- --stories       # re-post stories (they expire after 24 h)
+npm run demo:start                   # API on :3000 against the demo DB (stop the dev server first)
+```
+
+Log in as `aarav_mehta` / `Volunteer@2026`. To go back to everyday testing, stop it and run `npm start`.
+
 ## Layout
 
 ```

@@ -72,6 +72,29 @@ const companionList = z.preprocess(
         .max(MAX_COMPANIONS, `can name at most ${MAX_COMPANIONS} people`),
 );
 
+// Instagram-style post frames: every photo/video in a post is cropped to one of these
+// (width / height). Sent as `aspect`; without it, media keeps its own shape (old apps).
+const ASPECTS = { '1:1': 1, '4:5': 4 / 5, '1.91:1': 1.91 };
+
+// One crop per uploaded file, in upload order: the part of the (upright) photo or video
+// the user framed, as fractions of its width/height. null = centre crop. Multipart sends
+// one field, so a JSON string is accepted.
+const fraction = z.coerce.number().min(0).max(1);
+const cropRect = z
+    .strictObject({ x: fraction, y: fraction, w: fraction.min(0.02), h: fraction.min(0.02) })
+    .refine((c) => c.x + c.w <= 1.001 && c.y + c.h <= 1.001, 'must lie inside the media');
+const cropList = z.preprocess(
+    (v) => {
+        if (typeof v !== 'string') return v;
+        try {
+            return JSON.parse(v);
+        } catch {
+            return v;
+        }
+    },
+    z.array(cropRect.nullable(), { error: 'must be a list of crops' }).max(6, 'can have at most 6 crops'),
+);
+
 const createPost = z.strictObject({
     ...postFields,
     description: postFields.description.optional(),
@@ -82,9 +105,14 @@ const createPost = z.strictObject({
     inspiredByPostId: z.uuid('is not a valid post id').optional(),
     // People who were there and can vouch that it happened (inspired posts only).
     companions: companionList.optional(),
+    aspect: z.enum(Object.keys(ASPECTS), { error: `must be one of: ${Object.keys(ASPECTS).join(', ')}` }).optional(),
+    crops: cropList.optional(),
 }).refine((p) => !p.companions?.length || p.inspiredByPostId, {
     path: ['companions'],
     message: 'can only be named on an activity inspired by another post',
+}).refine((p) => !p.crops || p.aspect, {
+    path: ['crops'],
+    message: 'need an aspect',
 });
 
 // POST /posts/:id/vouch: a companion's answer to "were you there?".
@@ -108,6 +136,13 @@ const postParams = z.strictObject({ postId: z.uuid('is not a valid post id') });
 const recordView = z
     .strictObject({ watchMs: z.coerce.number().int().min(0).max(env.MAX_VIDEO_SECONDS * 1000).default(0) })
     .default({ watchMs: 0 });
+
+// POST /posts/:id/like: which reaction (good / excellent / fabulous). No body = good.
+// Sending a different reaction on a post you already reacted to switches it.
+const REACTIONS = ['good', 'excellent', 'fabulous'];
+const likePost = z
+    .strictObject({ reaction: z.enum(REACTIONS, { error: `must be one of: ${REACTIONS.join(', ')}` }).default('good') })
+    .default({ reaction: 'good' });
 
 const commentParams = z.strictObject({ commentId: z.uuid('is not a valid comment id') });
 
@@ -159,4 +194,7 @@ module.exports = {
     recordView,
     rippleTreeQuery,
     vouch,
+    REACTIONS,
+    likePost,
+    ASPECTS,
 };

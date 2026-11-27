@@ -38,6 +38,7 @@ coverage/
 
 # Uploads and temp files
 uploads/
+uploads-demo/
 tmp/
 *.tmp
 

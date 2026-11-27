@@ -37,7 +37,7 @@ exports.saved = async (req, res) => ok(res, await posts.savedPosts(req.user.id, 
 
 exports.userPosts = async (req, res) => ok(res, await posts.userPosts(req.user.id, req.params.user, req.validatedQuery));
 
-exports.like = async (req, res) => ok(res, await posts.likePost(req.user.id, req.params.postId));
+exports.like = async (req, res) => ok(res, await posts.likePost(req.user.id, req.params.postId, req.body.reaction));
 exports.unlike = async (req, res) => ok(res, await posts.unlikePost(req.user.id, req.params.postId));
 exports.likes = async (req, res) => ok(res, await posts.listLikes(req.user.id, req.params.postId, req.validatedQuery));
 exports.save = async (req, res) => ok(res, await posts.savePost(req.user.id, req.params.postId));
